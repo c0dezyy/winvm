@@ -100,7 +100,12 @@ jobs:
             Start-Sleep 2
             try { $addr = (Invoke-RestMethod http://127.0.0.1:4040/api/tunnels).tunnels[0].public_url } catch {}
           }
+          if (-not $addr) {
+            Write-Host "::error title=Tunnel failed::ngrok gave no address. Check NGROK_AUTHTOKEN, and that your ngrok account allows TCP tunnels (it may need verification)."
+            exit 1
+          }
           $addr = $addr -replace "tcp://", ""
+          Write-Host "::notice title=Remote Desktop::Address: $addr  |  User: runneradmin  |  Password: your RDP_PASSWORD"
           $msg = @"
           ## Remote Desktop details
           - **Address:** ``$addr``
