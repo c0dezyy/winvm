@@ -86,35 +86,39 @@ jobs:
             $sh.Save()
           }
 
-      # 4) Remote access tunnel
-      - name: Start tunnel
+      # 4) Remote access through Tailscale (free, no card needed)
+      - name: Start Tailscale
         shell: pwsh
         env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          choco install ngrok -y --no-progress
-          ngrok config add-authtoken $env:NGROK_AUTHTOKEN
-          Start-Process ngrok -ArgumentList "tcp 3389" -WindowStyle Hidden
-          $addr = $null
-          for ($i = 0; $i -lt 30 -and -not $addr; $i++) {
-            Start-Sleep 2
-            try { $addr = (Invoke-RestMethod http://127.0.0.1:4040/api/tunnels).tunnels[0].public_url } catch {}
-          }
-          if (-not $addr) {
-            Write-Host "::error title=Tunnel failed::ngrok gave no address. Check NGROK_AUTHTOKEN, and that your ngrok account allows TCP tunnels (it may need verification)."
+          if (-not $env:TS_AUTHKEY) {
+            Write-Host "::error title=Missing secret::Add the TAILSCALE_AUTHKEY secret."
             exit 1
           }
-          $addr = $addr -replace "tcp://", ""
-          Write-Host "::notice title=Remote Desktop::Address: $addr  |  User: runneradmin  |  Password: your RDP_PASSWORD"
+          New-NetFirewallRule -DisplayName "RDP-3389" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow | Out-Null
+          choco install tailscale -y --no-progress
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          & $ts up --authkey=$env:TS_AUTHKEY --hostname=winvm --unattended
+          $ip = $null
+          for ($i = 0; $i -lt 30 -and -not $ip; $i++) {
+            Start-Sleep 2
+            $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+          }
+          if (-not $ip) {
+            Write-Host "::error title=Tailscale failed::No Tailscale IP. Check that TAILSCALE_AUTHKEY is a valid, unexpired key."
+            exit 1
+          }
+          Write-Host "RDP ADDRESS: $ip"
+          Write-Host "::notice title=Remote Desktop::Address: $ip (or winvm)  |  User: runneradmin  |  Password: your RDP_PASSWORD"
           $msg = @"
           ## Remote Desktop details
-          - **Address:** ``$addr``
+          - **Address:** ``$ip`` (or ``winvm``)
           - **Username:** ``runneradmin``
           - **Password:** the RDP_PASSWORD secret you set
-          TLauncher opens automatically when you connect.
+          Your device must be logged into the same Tailscale account.
           "@
           Add-Content $env:GITHUB_STEP_SUMMARY $msg
-          Write-Host "RDP ADDRESS: $addr"
 
       # 5) Optional proxy
       - name: Apply proxy (optional)
