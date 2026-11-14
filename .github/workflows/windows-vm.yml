@@ -50,6 +50,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
 
       # 3) Apps
       - name: Install apps
@@ -85,6 +87,90 @@ jobs:
             $sh.TargetPath = "https://www.tiktok.com/live/studio"
             $sh.Save()
           }
+
+      # 3b) Software OpenGL (Mesa) so Minecraft runs without a video card
+      - name: Install Mesa software OpenGL
+        shell: pwsh
+        run: |
+          try {
+            $h = @{ Authorization = "Bearer $env:GH_TOKEN" }
+            $rel = Invoke-RestMethod "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest" -Headers $h
+            $asset = $rel.assets | Where-Object { $_.name -like "*release-msvc.7z" } | Select-Object -First 1
+            Invoke-WebRequest $asset.browser_download_url -OutFile C:\mesa.7z -UseBasicParsing
+            & "C:\Program Files\7-Zip\7z.exe" x C:\mesa.7z -oC:\mesa -y | Out-Null
+            Write-Host "Mesa ready: $($asset.name)"
+          } catch { Write-Host "Mesa download failed: $_" }
+          # helper that drops the Mesa DLLs next to every Java used by Minecraft (re-run while the VM is alive)
+          $script = @'
+          $src = "C:\mesa\x64"
+          if (-not (Test-Path $src)) { exit }
+          $names = "opengl32.dll","libgallium_wgl.dll","libglapi.dll","libGLESv2.dll","libEGL.dll"
+          $roots = "C:\Users\runneradmin\AppData\Roaming\.minecraft\runtime","C:\TLauncher","C:\Program Files\Eclipse Adoptium","C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk"
+          foreach ($r in $roots) {
+            if (-not (Test-Path $r)) { continue }
+            Get-ChildItem $r -Recurse -Include javaw.exe,java.exe -ErrorAction SilentlyContinue | ForEach-Object {
+              $d = $_.DirectoryName
+              if (-not (Test-Path "$d\opengl32.dll")) {
+                foreach ($n in $names) { if (Test-Path "$src\$n") { Copy-Item "$src\$n" $d -Force -ErrorAction SilentlyContinue } }
+              }
+            }
+          }
+          '@
+          Set-Content -Path C:\mesa-copy.ps1 -Value $script
+          & C:\mesa-copy.ps1
+
+      # 3c) Keep the desktop session alive when you disconnect (fixes RustDesk "no display")
+      - name: Keep session alive
+        shell: pwsh
+        run: |
+          $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item $ts -Force | Out-Null
+          Set-ItemProperty $ts -Name MaxDisconnectionTime -Value 0 -Type DWord
+          Set-ItemProperty $ts -Name MaxIdleTime -Value 0 -Type DWord
+          $keep = @'
+          while ($true) {
+            foreach ($l in (query session 2>$null)) {
+              if ($l -match 'runneradmin\s+(\d+)\s+Disc') { & tscon $Matches[1] /dest:console }
+            }
+            Start-Sleep 5
+          }
+          '@
+          Set-Content -Path C:\keep-session.ps1 -Value $keep
+          schtasks /create /tn KeepSession /tr "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\keep-session.ps1" /sc onstart /ru SYSTEM /f | Out-Null
+          schtasks /run /tn KeepSession | Out-Null
+
+      # 3d) RustDesk: connect anytime with an ID + password (same ID every session)
+      - name: Install RustDesk
+        shell: pwsh
+        env:
+          RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORD }}
+        run: |
+          if (-not $env:RUSTDESK_PASSWORD) { Write-Host "No RUSTDESK_PASSWORD secret, skipping RustDesk."; exit 0 }
+          $h = @{ Authorization = "Bearer $env:GH_TOKEN" }
+          $rel = Invoke-RestMethod "https://api.github.com/repos/rustdesk/rustdesk/releases/latest" -Headers $h
+          $asset = $rel.assets | Where-Object { $_.name -match '^rustdesk-[\d\.]+-x86_64\.exe$' } | Select-Object -First 1
+          Invoke-WebRequest $asset.browser_download_url -OutFile C:\rustdesk-setup.exe -UseBasicParsing
+          Start-Process C:\rustdesk-setup.exe -ArgumentList "--silent-install" -Wait
+          Start-Sleep 15
+          $rd = "C:\Program Files\RustDesk\rustdesk.exe"
+          if (-not (Get-Service RustDesk -ErrorAction SilentlyContinue)) {
+            Start-Process $rd -ArgumentList "--install-service" -Wait
+            Start-Sleep 10
+          }
+          Start-Service RustDesk -ErrorAction SilentlyContinue
+          Start-Process $rd -ArgumentList "--password", $env:RUSTDESK_PASSWORD -Wait
+          $id = ""
+          for ($i = 0; $i -lt 15 -and -not $id; $i++) {
+            Start-Sleep 3
+            $id = (cmd /c "`"$rd`" --get-id | more" | Out-String).Trim()
+          }
+          if (-not $id) {
+            Write-Host "::error title=RustDesk::Could not read the RustDesk ID."
+            exit 0
+          }
+          Write-Host "RUSTDESK ID: $id"
+          Write-Host "::notice title=RustDesk::ID: $id  |  Password: your RUSTDESK_PASSWORD"
+          Add-Content $env:GITHUB_STEP_SUMMARY "## RustDesk`n- **ID:** ``$id```n- **Password:** the RUSTDESK_PASSWORD secret"
 
       # 4) Remote access through Tailscale (free, no card needed)
       - name: Start Tailscale
@@ -142,7 +228,10 @@ jobs:
         shell: pwsh
         run: |
           $end = (Get-Date).AddHours([double]"${{ github.event.inputs.hours }}")
-          while ((Get-Date) -lt $end) { Start-Sleep -Seconds 60 }
+          while ((Get-Date) -lt $end) {
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 20
+          }
 
       # 7) SAVE state (also runs if you cancel the run manually)
       - name: Close apps so files are flushed
@@ -165,6 +254,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
 
       # 8) Delete older saves (repo cache limit is 10 GB) and chain the next session
       - name: Clean old saves
