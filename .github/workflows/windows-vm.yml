@@ -469,15 +469,15 @@ jobs:
           param([string]$Status = "online")
           $ErrorActionPreference = "Stop"
           if (-not (Test-Path C:\info-topic.txt)) { exit 0 }
-          function Rd($f) { if (Test-Path $f) { (Get-Content $f -Raw) } else { "" } }
-          $topic = (Rd C:\info-topic.txt).Trim()
-          $pass = Rd C:\info-pass.txt
+          function ReadInfo($f) { if (Test-Path $f) { [string](Get-Content $f -Raw) } else { "" } }
+          $topic = (ReadInfo C:\info-topic.txt).Trim()
+          $pass = ReadInfo C:\info-pass.txt
           $inv = [Globalization.CultureInfo]::InvariantCulture
-          $start = [DateTimeOffset]::Parse((Rd C:\session-start.txt).Trim(), $inv).ToUnixTimeSeconds()
-          $end = [DateTimeOffset]::Parse((Rd C:\session-end.txt).Trim(), $inv).ToUnixTimeSeconds()
+          $start = [DateTimeOffset]::Parse((ReadInfo C:\session-start.txt).Trim(), $inv).ToUnixTimeSeconds()
+          $end = [DateTimeOffset]::Parse((ReadInfo C:\session-end.txt).Trim(), $inv).ToUnixTimeSeconds()
           $info = [ordered]@{
-            status = $Status; id = (Rd C:\rustdesk-id.txt); pw = (Rd C:\rustdesk-pw.txt)
-            ip = (Rd C:\ts-ip.txt); host = "winvm"; user = "runneradmin"
+            status = $Status; id = (ReadInfo C:\rustdesk-id.txt); pw = (ReadInfo C:\rustdesk-pw.txt)
+            ip = (ReadInfo C:\ts-ip.txt); host = "winvm"; user = "runneradmin"
             start = $start; end = $end; ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
           } | ConvertTo-Json -Compress
           $salt = [byte[]]::new(16); [Security.Cryptography.RandomNumberGenerator]::Fill($salt)
