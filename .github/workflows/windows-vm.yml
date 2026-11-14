@@ -71,7 +71,7 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: |
-          Remove-Item "C:\Users\runneradmin\Desktop\STOP.txt","C:\stop.flag" -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\Users\runneradmin\Desktop\STOP.txt","C:\Users\runneradmin\Desktop\SHUTDOWN.txt","C:\stop.flag","C:\shutdown.flag","C:\restart-now.flag" -Force -ErrorAction SilentlyContinue
           foreach ($m in @(@("PF","C:\Program Files"), @("PF86","C:\Program Files (x86)"))) {
             $src = "C:\Persist\$($m[0])"
             if (-not (Test-Path $src)) { continue }
@@ -278,6 +278,7 @@ jobs:
             exit 1
           }
           Write-Host "RUSTDESK ID: $id"
+          Set-Content C:\rustdesk-id.txt $id -NoNewline
           Write-Host "::notice title=RustDesk::ID: $id  |  Password: your RUSTDESK_PASSWORD"
           Add-Content $env:GITHUB_STEP_SUMMARY "## RustDesk`n- **ID:** ``$id```n- **Password:** the RUSTDESK_PASSWORD secret"
 
@@ -348,6 +349,7 @@ jobs:
             exit 1
           }
           Write-Host "RDP ADDRESS: $ip"
+          Set-Content C:\ts-ip.txt $ip -NoNewline
           Write-Host "::notice title=Remote Desktop::Address: $ip (or winvm)  |  User: runneradmin  |  Password: your RDP_PASSWORD"
           $msg = @"
           ## Remote Desktop details
@@ -383,6 +385,7 @@ jobs:
           $overlap = [int]"${{ github.event.inputs.overlap || '6' }}"
           $handoff = $end
           if ("${{ github.event.inputs.auto_restart || 'true' }}" -eq 'true') { $handoff = $end.AddMinutes(-$overlap) }
+          Set-Content C:\session-start.txt (Get-Date).ToString("o")
           Set-Content C:\session-end.txt $end.ToString("o")
           Set-Content C:\handoff-time.txt $handoff.ToString("o")
           Write-Host "Session ends: $end | next session starts at: $handoff"
@@ -403,6 +406,51 @@ jobs:
           '@
           Set-Content -Path C:\sync-out.ps1 -Value $sync
 
+      # 5c) Publish the RustDesk info (encrypted) so the info page updates by itself
+      - name: Publish RustDesk info
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          INFO_TOPIC: ${{ secrets.INFO_TOPIC }}
+          PAGE_PASSWORD: ${{ secrets.PAGE_PASSWORD }}
+          RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORD }}
+        run: |
+          if (-not $env:INFO_TOPIC -or -not $env:PAGE_PASSWORD) { Write-Host "INFO_TOPIC or PAGE_PASSWORD secret missing, skipping the info page."; exit 0 }
+          Set-Content C:\info-topic.txt $env:INFO_TOPIC -NoNewline
+          Set-Content C:\info-pass.txt $env:PAGE_PASSWORD -NoNewline
+          Set-Content C:\rustdesk-pw.txt $env:RUSTDESK_PASSWORD -NoNewline
+          $script = @'
+          param([string]$Status = "online")
+          $ErrorActionPreference = "Stop"
+          if (-not (Test-Path C:\info-topic.txt)) { exit 0 }
+          function Rd($f) { if (Test-Path $f) { (Get-Content $f -Raw) } else { "" } }
+          $topic = (Rd C:\info-topic.txt).Trim()
+          $pass = Rd C:\info-pass.txt
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $start = [DateTimeOffset]::Parse((Rd C:\session-start.txt).Trim(), $inv).ToUnixTimeSeconds()
+          $end = [DateTimeOffset]::Parse((Rd C:\session-end.txt).Trim(), $inv).ToUnixTimeSeconds()
+          $info = [ordered]@{
+            status = $Status; id = (Rd C:\rustdesk-id.txt); pw = (Rd C:\rustdesk-pw.txt)
+            ip = (Rd C:\ts-ip.txt); host = "winvm"; user = "runneradmin"
+            start = $start; end = $end; ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          } | ConvertTo-Json -Compress
+          $salt = [byte[]]::new(16); [Security.Cryptography.RandomNumberGenerator]::Fill($salt)
+          $nonce = [byte[]]::new(12); [Security.Cryptography.RandomNumberGenerator]::Fill($nonce)
+          $key = [Security.Cryptography.Rfc2898DeriveBytes]::Pbkdf2([Text.Encoding]::UTF8.GetBytes($pass), $salt, 100000, [Security.Cryptography.HashAlgorithmName]::SHA256, 32)
+          $plain = [Text.Encoding]::UTF8.GetBytes($info)
+          $ct = [byte[]]::new($plain.Length); $tag = [byte[]]::new(16)
+          try { $aes = [Security.Cryptography.AesGcm]::new($key, 16) } catch { $aes = [Security.Cryptography.AesGcm]::new($key) }
+          $aes.Encrypt($nonce, $plain, $ct, $tag)
+          $all = [byte[]]::new($ct.Length + 16)
+          [Array]::Copy($ct, 0, $all, 0, $ct.Length); [Array]::Copy($tag, 0, $all, $ct.Length, 16)
+          $msg = @{ v = 1; s = [Convert]::ToBase64String($salt); n = [Convert]::ToBase64String($nonce); d = [Convert]::ToBase64String($all) } | ConvertTo-Json -Compress
+          Invoke-RestMethod -Uri "https://ntfy.sh/$topic" -Method Post -Body $msg -ContentType "text/plain" -TimeoutSec 20 | Out-Null
+          Write-Host "Info published: $Status"
+          '@
+          Set-Content C:\publish-info.ps1 $script
+          & C:\publish-info.ps1 online
+
       # 6.1) Run until the next save, then save a checkpoint
       - name: Run VM (part 1)
         id: c1
@@ -421,8 +469,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -487,8 +536,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -553,8 +603,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -619,8 +670,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -685,8 +737,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -751,8 +804,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -817,8 +871,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -883,8 +938,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -949,8 +1005,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -1015,8 +1072,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -1081,8 +1139,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -1147,8 +1206,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -1213,8 +1273,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -1279,8 +1340,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -1345,8 +1407,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -1411,8 +1474,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -1477,8 +1541,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -1543,8 +1608,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -1609,8 +1675,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -1675,8 +1742,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -1741,8 +1809,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -1807,8 +1876,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -1873,8 +1943,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -1939,8 +2010,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -2005,8 +2077,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -2071,8 +2144,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -2137,8 +2211,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -2203,8 +2278,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -2269,8 +2345,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -2335,8 +2412,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -2401,8 +2479,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -2467,8 +2546,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -2533,8 +2613,9 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
               Write-Host "STOP file found, ending safely."
               break
@@ -2588,8 +2669,9 @@ jobs:
           $inv = [Globalization.CultureInfo]::InvariantCulture
           $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
           while ((Get-Date) -lt $handoff -and -not (Test-Path C:\stop.flag)) {
-            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+            if ((Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") -or (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt")) {
               New-Item C:\stop.flag -Force | Out-Null
+              if (Test-Path "C:\Users\runneradmin\Desktop\SHUTDOWN.txt") { New-Item C:\shutdown.flag -Force | Out-Null } else { New-Item C:\restart-now.flag -Force | Out-Null }
               Write-Host "STOP file found, ending safely."
               break
             }
@@ -2602,9 +2684,19 @@ jobs:
         id: h
         shell: pwsh
         run: |
-          if (Test-Path C:\stop.flag) { Write-Host "Stopped by you, no handoff."; exit 0 }
+          if (Test-Path C:\shutdown.flag) { Write-Host "Shutdown requested, no restart."; exit 0 }
           if ("${{ github.event.inputs.auto_restart || 'true' }}" -eq 'true') {
             Add-Content -Path $env:GITHUB_OUTPUT -Value "do=true"
+          }
+
+      - name: Handoff - close apps
+        if: steps.h.outputs.do == 'true'
+        shell: pwsh
+        run: |
+          if (Test-Path C:\restart-now.flag) {
+            Write-Host "STOP.txt used: closing apps, saving, and starting the next session now."
+            Get-Process javaw, java, "TikTok LIVE Studio*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep 3
           }
 
       - name: Handoff - collect apps
@@ -2649,6 +2741,10 @@ jobs:
         run: |
           $inv = [Globalization.CultureInfo]::InvariantCulture
           $end = [datetime]::Parse((Get-Content C:\session-end.txt), $inv)
+          if (Test-Path C:\restart-now.flag) {
+            $short = (Get-Date).AddMinutes([int]"${{ github.event.inputs.overlap || '6' }}")
+            if ($short -lt $end) { $end = $short }
+          }
           while ((Get-Date) -lt $end) {
             try { & C:\mesa-copy.ps1 } catch {}
             Start-Sleep -Seconds 15
@@ -2661,6 +2757,12 @@ jobs:
         run: |
           Get-Process javaw, java, "TikTok LIVE Studio*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           Start-Sleep 3
+
+      - name: Publish offline status
+        if: always() && steps.h.outputs.do != 'true'
+        shell: pwsh
+        continue-on-error: true
+        run: 'if (Test-Path C:\publish-info.ps1) { & C:\publish-info.ps1 offline }'
 
       - name: Final - collect apps
         if: always() && steps.h.outputs.do != 'true'
