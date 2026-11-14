@@ -94,32 +94,33 @@ jobs:
         continue-on-error: true
         run: |
           $mesaDir = $null
-          try {
-            $h = @{ Authorization = "Bearer $env:GH_TOKEN" }
-            $rel = Invoke-RestMethod "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest" -Headers $h
-            Write-Host "Mesa release: $($rel.tag_name)"
-            Write-Host ("Assets: " + (($rel.assets | ForEach-Object { $_.name }) -join ", "))
-            $asset = $rel.assets | Where-Object { $_.name -like "*-release-msvc.7z" } | Select-Object -First 1
-            if (-not $asset) { throw "No MSVC .7z asset found in the release" }
-            Invoke-WebRequest $asset.browser_download_url -OutFile C:\mesa.7z -UseBasicParsing
-            Write-Host "Downloaded $($asset.name): $([math]::Round((Get-Item C:\mesa.7z).Length / 1MB, 1)) MB"
-            $7z = "C:\Program Files\7-Zip\7z.exe"
-            if (-not (Test-Path $7z)) { choco install 7zip -y --no-progress | Out-Null }
-            & $7z x C:\mesa.7z -oC:\mesa -y | Out-Null
-            Write-Host "7z exit code: $LASTEXITCODE"
-            # find the 64-bit folder instead of assuming where it is
-            $gl = Get-ChildItem C:\mesa -Recurse -Filter libgallium_wgl.dll -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1
-            if (-not $gl) { $gl = Get-ChildItem C:\mesa -Recurse -Filter opengl32.dll -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1 }
-            if ($gl) {
-              $mesaDir = $gl.DirectoryName
-              Set-Content C:\mesa-dir.txt $mesaDir
-              Write-Host "Mesa folder: $mesaDir"
-              Write-Host ("Files: " + ((Get-ChildItem $mesaDir -Filter *.dll | ForEach-Object { $_.Name }) -join ", "))
-            } else {
-              Write-Host "::error title=Mesa::Mesa DLLs not found after extracting. Folder listing follows."
-              Get-ChildItem C:\mesa -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object -First 60 | ForEach-Object { Write-Host $_.FullName }
-            }
-          } catch { Write-Host "::error title=Mesa::$_" }
+          $7z = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path $7z)) { choco install 7zip -y --no-progress | Out-Null }
+          # Mesa 26.2.6 MSVC no longer ships the OpenGL files, so try known-good versions in order
+          foreach ($v in "23.3.1", "26.2.0") {
+            if ($mesaDir) { break }
+            try {
+              Write-Host "Trying Mesa $v"
+              Remove-Item C:\mesa -Recurse -Force -ErrorAction SilentlyContinue
+              Invoke-WebRequest "https://github.com/pal1000/mesa-dist-win/releases/download/$v/mesa3d-$v-release-msvc.7z" -OutFile C:\mesa.7z -UseBasicParsing
+              Write-Host "Downloaded: $([math]::Round((Get-Item C:\mesa.7z).Length / 1MB, 1)) MB"
+              & $7z x C:\mesa.7z -oC:\mesa -y | Out-Null
+              Write-Host "7z exit code: $LASTEXITCODE"
+              $gl = Get-ChildItem C:\mesa -Recurse -Filter libgallium_wgl.dll -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1
+              if (-not $gl) { $gl = Get-ChildItem C:\mesa -Recurse -Filter opengl32.dll -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1 }
+              if ($gl) {
+                $mesaDir = $gl.DirectoryName
+                Set-Content C:\mesa-dir.txt $mesaDir
+                Write-Host "Mesa $v folder: $mesaDir"
+                Write-Host ("Files: " + ((Get-ChildItem $mesaDir -Filter *.dll | ForEach-Object { $_.Name }) -join ", "))
+              } else {
+                Write-Host "Mesa $v has no OpenGL driver files, trying next"
+              }
+            } catch { Write-Host "Mesa $v failed: $_" }
+          }
+          if (-not $mesaDir) {
+            Write-Host "::error title=Mesa::No Mesa OpenGL files found in any version tried."
+          }
 
           # System-wide: replace the Windows opengl32.dll with Mesa's, so Minecraft works whatever Java it uses
           if ($mesaDir) {
