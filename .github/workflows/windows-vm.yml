@@ -91,31 +91,55 @@ jobs:
       # 3b) Software OpenGL (Mesa) so Minecraft runs without a video card
       - name: Install Mesa software OpenGL
         shell: pwsh
+        continue-on-error: true
         run: |
+          $mesaDir = $null
           try {
             $h = @{ Authorization = "Bearer $env:GH_TOKEN" }
             $rel = Invoke-RestMethod "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest" -Headers $h
-            $asset = $rel.assets | Where-Object { $_.name -like "*release-msvc.7z" } | Select-Object -First 1
+            Write-Host "Mesa release: $($rel.tag_name)"
+            Write-Host ("Assets: " + (($rel.assets | ForEach-Object { $_.name }) -join ", "))
+            $asset = $rel.assets | Where-Object { $_.name -like "*msvc*.7z" } | Select-Object -First 1
+            if (-not $asset) { throw "No MSVC .7z asset found in the release" }
             Invoke-WebRequest $asset.browser_download_url -OutFile C:\mesa.7z -UseBasicParsing
-            & "C:\Program Files\7-Zip\7z.exe" x C:\mesa.7z -oC:\mesa -y | Out-Null
-            Write-Host "Mesa ready: $($asset.name)"
-          } catch { Write-Host "Mesa download failed: $_" }
-          # System-wide: replace the Windows opengl32.dll with Mesa's, so Minecraft works whatever Java it uses
-          try {
-            $sys = "C:\Windows\System32"
-            takeown /f "$sys\opengl32.dll" | Out-Null
-            icacls "$sys\opengl32.dll" /grant "Administrators:F" | Out-Null
-            if (-not (Test-Path "$sys\opengl32.orig.dll")) { Rename-Item "$sys\opengl32.dll" "opengl32.orig.dll" }
-            foreach ($n in "opengl32.dll","libgallium_wgl.dll","libglapi.dll") {
-              if (Test-Path "C:\mesa\x64\$n") { Copy-Item "C:\mesa\x64\$n" $sys -Force }
+            Write-Host "Downloaded $($asset.name): $([math]::Round((Get-Item C:\mesa.7z).Length / 1MB, 1)) MB"
+            $7z = "C:\Program Files\7-Zip\7z.exe"
+            if (-not (Test-Path $7z)) { choco install 7zip -y --no-progress | Out-Null }
+            & $7z x C:\mesa.7z -oC:\mesa -y | Out-Null
+            Write-Host "7z exit code: $LASTEXITCODE"
+            # find the 64-bit folder instead of assuming where it is
+            $gl = Get-ChildItem C:\mesa -Recurse -Filter libgallium_wgl.dll -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1
+            if (-not $gl) { $gl = Get-ChildItem C:\mesa -Recurse -Filter opengl32.dll -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1 }
+            if ($gl) {
+              $mesaDir = $gl.DirectoryName
+              Set-Content C:\mesa-dir.txt $mesaDir
+              Write-Host "Mesa folder: $mesaDir"
+              Write-Host ("Files: " + ((Get-ChildItem $mesaDir -Filter *.dll | ForEach-Object { $_.Name }) -join ", "))
+            } else {
+              Write-Host "::error title=Mesa::Mesa DLLs not found after extracting. Folder listing follows."
+              Get-ChildItem C:\mesa -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object -First 60 | ForEach-Object { Write-Host $_.FullName }
             }
-            Write-Host "System-wide Mesa installed: $(Test-Path "$sys\libgallium_wgl.dll")"
-          } catch { Write-Host "System-wide Mesa failed: $_" }
+          } catch { Write-Host "::error title=Mesa::$_" }
+
+          # System-wide: replace the Windows opengl32.dll with Mesa's, so Minecraft works whatever Java it uses
+          if ($mesaDir) {
+            try {
+              $sys = "C:\Windows\System32"
+              takeown /f "$sys\opengl32.dll" | Out-Null
+              icacls "$sys\opengl32.dll" /grant "Administrators:F" | Out-Null
+              if (-not (Test-Path "$sys\opengl32.orig.dll")) { Rename-Item "$sys\opengl32.dll" "opengl32.orig.dll" }
+              foreach ($n in "opengl32.dll","libgallium_wgl.dll","libglapi.dll","dxil.dll") {
+                if (Test-Path "$mesaDir\$n") { Copy-Item "$mesaDir\$n" $sys -Force }
+              }
+              Write-Host "System-wide Mesa installed: $(Test-Path "$sys\libgallium_wgl.dll")"
+            } catch { Write-Host "System-wide Mesa failed: $_" }
+          }
+
           # helper that drops the Mesa DLLs next to every Java used by Minecraft (re-run while the VM is alive)
           $script = @'
-          $src = "C:\mesa\x64"
-          if (-not (Test-Path $src)) { exit }
-          $names = "opengl32.dll","libgallium_wgl.dll","libglapi.dll","libGLESv2.dll","libEGL.dll"
+          $src = Get-Content C:\mesa-dir.txt -ErrorAction SilentlyContinue
+          if (-not $src -or -not (Test-Path $src)) { exit }
+          $names = "opengl32.dll","libgallium_wgl.dll","libglapi.dll","dxil.dll"
           $roots = "C:\Users\runneradmin\AppData\Roaming\.minecraft\runtime","C:\Users\runneradmin\AppData\Roaming\.tlauncher","C:\Program Files\Java","C:\TLauncher","C:\Program Files\Eclipse Adoptium","C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk"
           foreach ($r in $roots) {
             if (-not (Test-Path $r)) { continue }
