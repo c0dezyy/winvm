@@ -142,6 +142,8 @@ jobs:
       # 3d) RustDesk: connect anytime with an ID + password (same ID every session)
       - name: Install RustDesk
         shell: pwsh
+        timeout-minutes: 8
+        continue-on-error: true
         env:
           RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORD }}
         run: |
@@ -149,24 +151,47 @@ jobs:
           $h = @{ Authorization = "Bearer $env:GH_TOKEN" }
           $rel = Invoke-RestMethod "https://api.github.com/repos/rustdesk/rustdesk/releases/latest" -Headers $h
           $asset = $rel.assets | Where-Object { $_.name -match '^rustdesk-[\d\.]+-x86_64\.exe$' } | Select-Object -First 1
+          Write-Host "Downloading $($asset.name)"
           Invoke-WebRequest $asset.browser_download_url -OutFile C:\rustdesk-setup.exe -UseBasicParsing
-          Start-Process C:\rustdesk-setup.exe -ArgumentList "--silent-install" -Wait
-          Start-Sleep 15
           $rd = "C:\Program Files\RustDesk\rustdesk.exe"
+
+          # Never use Start-Process -Wait here: RustDesk keeps child processes running and the step would hang forever
+          $p = Start-Process C:\rustdesk-setup.exe -ArgumentList "--silent-install" -PassThru
+          for ($i = 0; $i -lt 30 -and -not (Test-Path $rd); $i++) { Start-Sleep 3 }
+          Start-Sleep 10
+          Write-Host "RustDesk installed: $(Test-Path $rd)"
+          if (-not (Test-Path $rd)) { Write-Host "::error title=RustDesk::Install failed"; exit 1 }
+
           if (-not (Get-Service RustDesk -ErrorAction SilentlyContinue)) {
-            Start-Process $rd -ArgumentList "--install-service" -Wait
-            Start-Sleep 10
+            Start-Process $rd -ArgumentList "--install-service" | Out-Null
+            Start-Sleep 15
           }
           Start-Service RustDesk -ErrorAction SilentlyContinue
-          Start-Process $rd -ArgumentList "--password", $env:RUSTDESK_PASSWORD -Wait
+
+          $p = Start-Process $rd -ArgumentList "--password", $env:RUSTDESK_PASSWORD -PassThru
+          $p | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
+          if (-not $p.HasExited) { $p | Stop-Process -Force -ErrorAction SilentlyContinue }
+          Write-Host "Password set"
+
           $id = ""
-          for ($i = 0; $i -lt 15 -and -not $id; $i++) {
-            Start-Sleep 3
-            $id = (cmd /c "`"$rd`" --get-id | more" | Out-String).Trim()
+          for ($i = 0; $i -lt 5 -and -not $id; $i++) {
+            $job = Start-Job -ScriptBlock { param($r) cmd /c "`"$r`" --get-id | more" } -ArgumentList $rd
+            if (Wait-Job $job -Timeout 20) { $id = (Receive-Job $job | Out-String).Trim() }
+            Stop-Job $job -ErrorAction SilentlyContinue
+            Remove-Job $job -Force -ErrorAction SilentlyContinue
+            if (-not $id) { Start-Sleep 3 }
+          }
+          if (-not $id) {
+            foreach ($f in "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config\RustDesk.toml", "$env:APPDATA\RustDesk\config\RustDesk.toml") {
+              if (Test-Path $f) {
+                $m = Select-String -Path $f -Pattern "^id\s*=\s*'?(\d+)'?"
+                if ($m) { $id = $m.Matches[0].Groups[1].Value; break }
+              }
+            }
           }
           if (-not $id) {
             Write-Host "::error title=RustDesk::Could not read the RustDesk ID."
-            exit 0
+            exit 1
           }
           Write-Host "RUSTDESK ID: $id"
           Write-Host "::notice title=RustDesk::ID: $id  |  Password: your RUSTDESK_PASSWORD"
