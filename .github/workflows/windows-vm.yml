@@ -4,11 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       hours:
-        description: "Hours to keep this session alive (max 5.5)"
+        description: "How long each session lives (max 5.5)"
         default: "5"
       auto_restart:
-        description: "Auto-start a new session when this one ends (true/false)"
+        description: "Start the next session before this one ends (true/false)"
         default: "true"
+      save_every:
+        description: "Minutes between saves (10 or more)"
+        default: "10"
+      overlap:
+        description: "Minutes before the end to start the next session"
+        default: "6"
 
 permissions:
   contents: read
@@ -47,6 +53,7 @@ jobs:
             C:\Users\runneradmin\AppData\Roaming\.tlauncher
             C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
@@ -56,6 +63,24 @@ jobs:
             C:\Users\runneradmin\Downloads
             C:\Users\runneradmin\AppData\Local\Programs
             C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      # 2b) Put apps you installed last time back into Program Files
+      - name: Restore installed apps
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Remove-Item "C:\Users\runneradmin\Desktop\STOP.txt","C:\stop.flag" -Force -ErrorAction SilentlyContinue
+          foreach ($m in @(@("PF","C:\Program Files"), @("PF86","C:\Program Files (x86)"))) {
+            $src = "C:\Persist\$($m[0])"
+            if (-not (Test-Path $src)) { continue }
+            Get-ChildItem $src -Directory | ForEach-Object {
+              Write-Host "Restoring app folder: $($_.Name)"
+              robocopy $_.FullName (Join-Path $m[1] $_.Name) /MIR /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+            }
+          }
+          exit 0
 
       # 3) Apps
       - name: Install apps
@@ -349,35 +374,81 @@ jobs:
           $opts = "-Dhttp.proxyHost=$($u.Host) -Dhttp.proxyPort=$($u.Port) -Dhttps.proxyHost=$($u.Host) -Dhttps.proxyPort=$($u.Port)"
           [Environment]::SetEnvironmentVariable("JAVA_TOOL_OPTIONS", $opts, "Machine")
 
-      # 6) Keep alive (light loop)
-      - name: Keep alive
-        id: keep
+      # 5b) Remember what is installed now, and plan the session times
+      - name: Take app baseline
         shell: pwsh
         run: |
-          $end = (Get-Date).AddHours([double]"${{ github.event.inputs.hours }}")
+          Get-ChildItem "C:\Program Files","C:\Program Files (x86)" -Directory | ForEach-Object { $_.FullName } | Set-Content C:\baseline-pf.txt
+          $end = (Get-Date).AddHours([double]"${{ github.event.inputs.hours || '5' }}")
+          $overlap = [int]"${{ github.event.inputs.overlap || '6' }}"
+          $handoff = $end
+          if ("${{ github.event.inputs.auto_restart || 'true' }}" -eq 'true') { $handoff = $end.AddMinutes(-$overlap) }
+          Set-Content C:\session-end.txt $end.ToString("o")
+          Set-Content C:\handoff-time.txt $handoff.ToString("o")
+          Write-Host "Session ends: $end | next session starts at: $handoff"
+          $sync = @'
+          if (-not (Test-Path C:\baseline-pf.txt)) { exit 0 }
+          $base = @(Get-Content C:\baseline-pf.txt)
+          foreach ($m in @(@("PF","C:\Program Files"), @("PF86","C:\Program Files (x86)"))) {
+            $dst = "C:\Persist\$($m[0])"
+            New-Item -ItemType Directory -Force $dst | Out-Null
+            Get-ChildItem $m[1] -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+              $target = Join-Path $dst $_.Name
+              if (($base -notcontains $_.FullName) -or (Test-Path $target)) {
+                robocopy $_.FullName $target /MIR /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+              }
+            }
+          }
+          exit 0
+          '@
+          Set-Content -Path C:\sync-out.ps1 -Value $sync
+
+      # 6.1) Run until the next save, then save a checkpoint
+      - name: Run VM (part 1)
+        id: c1
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
           while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
             try { & C:\mesa-copy.ps1 } catch {}
-            Start-Sleep -Seconds 20
+            Start-Sleep -Seconds 15
           }
 
-      # 7) SAVE state (also runs if you cancel the run manually)
-      - name: Close apps so files are flushed
-        if: always()
+      - name: Checkpoint 1 - collect apps
+        if: ${{ steps.c1.outputs.ran == 'true' && steps.c1.outputs.stopped != 'true' && steps.c1.outputs.last != 'true' }}
         shell: pwsh
-        run: |
-          Get-Process javaw, java, "TikTok LIVE Studio*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          Start-Sleep 5
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
 
-      - name: Save state
-        if: always()
+      - name: Checkpoint 1 - save
+        if: ${{ steps.c1.outputs.ran == 'true' && steps.c1.outputs.stopped != 'true' && steps.c1.outputs.last != 'true' }}
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
-          key: vm-state-${{ github.run_id }}
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c1
           path: |
             C:\Users\runneradmin\AppData\Roaming\.minecraft
             C:\Users\runneradmin\AppData\Roaming\.tlauncher
             C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
@@ -387,16 +458,2243 @@ jobs:
             C:\Users\runneradmin\Downloads
             C:\Users\runneradmin\AppData\Local\Programs
             C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
 
-      # 8) Delete older saves (repo cache limit is 10 GB) and chain the next session
-      - name: Clean old saves
+      - name: Checkpoint 1 - clean old saves
+        if: ${{ steps.c1.outputs.ran == 'true' && steps.c1.outputs.stopped != 'true' && steps.c1.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.2) Run until the next save, then save a checkpoint
+      - name: Run VM (part 2)
+        id: c2
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 2 - collect apps
+        if: ${{ steps.c2.outputs.ran == 'true' && steps.c2.outputs.stopped != 'true' && steps.c2.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 2 - save
+        if: ${{ steps.c2.outputs.ran == 'true' && steps.c2.outputs.stopped != 'true' && steps.c2.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c2
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 2 - clean old saves
+        if: ${{ steps.c2.outputs.ran == 'true' && steps.c2.outputs.stopped != 'true' && steps.c2.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.3) Run until the next save, then save a checkpoint
+      - name: Run VM (part 3)
+        id: c3
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 3 - collect apps
+        if: ${{ steps.c3.outputs.ran == 'true' && steps.c3.outputs.stopped != 'true' && steps.c3.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 3 - save
+        if: ${{ steps.c3.outputs.ran == 'true' && steps.c3.outputs.stopped != 'true' && steps.c3.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c3
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 3 - clean old saves
+        if: ${{ steps.c3.outputs.ran == 'true' && steps.c3.outputs.stopped != 'true' && steps.c3.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.4) Run until the next save, then save a checkpoint
+      - name: Run VM (part 4)
+        id: c4
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 4 - collect apps
+        if: ${{ steps.c4.outputs.ran == 'true' && steps.c4.outputs.stopped != 'true' && steps.c4.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 4 - save
+        if: ${{ steps.c4.outputs.ran == 'true' && steps.c4.outputs.stopped != 'true' && steps.c4.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c4
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 4 - clean old saves
+        if: ${{ steps.c4.outputs.ran == 'true' && steps.c4.outputs.stopped != 'true' && steps.c4.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.5) Run until the next save, then save a checkpoint
+      - name: Run VM (part 5)
+        id: c5
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 5 - collect apps
+        if: ${{ steps.c5.outputs.ran == 'true' && steps.c5.outputs.stopped != 'true' && steps.c5.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 5 - save
+        if: ${{ steps.c5.outputs.ran == 'true' && steps.c5.outputs.stopped != 'true' && steps.c5.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c5
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 5 - clean old saves
+        if: ${{ steps.c5.outputs.ran == 'true' && steps.c5.outputs.stopped != 'true' && steps.c5.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.6) Run until the next save, then save a checkpoint
+      - name: Run VM (part 6)
+        id: c6
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 6 - collect apps
+        if: ${{ steps.c6.outputs.ran == 'true' && steps.c6.outputs.stopped != 'true' && steps.c6.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 6 - save
+        if: ${{ steps.c6.outputs.ran == 'true' && steps.c6.outputs.stopped != 'true' && steps.c6.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c6
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 6 - clean old saves
+        if: ${{ steps.c6.outputs.ran == 'true' && steps.c6.outputs.stopped != 'true' && steps.c6.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.7) Run until the next save, then save a checkpoint
+      - name: Run VM (part 7)
+        id: c7
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 7 - collect apps
+        if: ${{ steps.c7.outputs.ran == 'true' && steps.c7.outputs.stopped != 'true' && steps.c7.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 7 - save
+        if: ${{ steps.c7.outputs.ran == 'true' && steps.c7.outputs.stopped != 'true' && steps.c7.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c7
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 7 - clean old saves
+        if: ${{ steps.c7.outputs.ran == 'true' && steps.c7.outputs.stopped != 'true' && steps.c7.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.8) Run until the next save, then save a checkpoint
+      - name: Run VM (part 8)
+        id: c8
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 8 - collect apps
+        if: ${{ steps.c8.outputs.ran == 'true' && steps.c8.outputs.stopped != 'true' && steps.c8.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 8 - save
+        if: ${{ steps.c8.outputs.ran == 'true' && steps.c8.outputs.stopped != 'true' && steps.c8.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c8
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 8 - clean old saves
+        if: ${{ steps.c8.outputs.ran == 'true' && steps.c8.outputs.stopped != 'true' && steps.c8.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.9) Run until the next save, then save a checkpoint
+      - name: Run VM (part 9)
+        id: c9
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 9 - collect apps
+        if: ${{ steps.c9.outputs.ran == 'true' && steps.c9.outputs.stopped != 'true' && steps.c9.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 9 - save
+        if: ${{ steps.c9.outputs.ran == 'true' && steps.c9.outputs.stopped != 'true' && steps.c9.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c9
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 9 - clean old saves
+        if: ${{ steps.c9.outputs.ran == 'true' && steps.c9.outputs.stopped != 'true' && steps.c9.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.10) Run until the next save, then save a checkpoint
+      - name: Run VM (part 10)
+        id: c10
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 10 - collect apps
+        if: ${{ steps.c10.outputs.ran == 'true' && steps.c10.outputs.stopped != 'true' && steps.c10.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 10 - save
+        if: ${{ steps.c10.outputs.ran == 'true' && steps.c10.outputs.stopped != 'true' && steps.c10.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c10
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 10 - clean old saves
+        if: ${{ steps.c10.outputs.ran == 'true' && steps.c10.outputs.stopped != 'true' && steps.c10.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.11) Run until the next save, then save a checkpoint
+      - name: Run VM (part 11)
+        id: c11
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 11 - collect apps
+        if: ${{ steps.c11.outputs.ran == 'true' && steps.c11.outputs.stopped != 'true' && steps.c11.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 11 - save
+        if: ${{ steps.c11.outputs.ran == 'true' && steps.c11.outputs.stopped != 'true' && steps.c11.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c11
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 11 - clean old saves
+        if: ${{ steps.c11.outputs.ran == 'true' && steps.c11.outputs.stopped != 'true' && steps.c11.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.12) Run until the next save, then save a checkpoint
+      - name: Run VM (part 12)
+        id: c12
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 12 - collect apps
+        if: ${{ steps.c12.outputs.ran == 'true' && steps.c12.outputs.stopped != 'true' && steps.c12.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 12 - save
+        if: ${{ steps.c12.outputs.ran == 'true' && steps.c12.outputs.stopped != 'true' && steps.c12.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c12
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 12 - clean old saves
+        if: ${{ steps.c12.outputs.ran == 'true' && steps.c12.outputs.stopped != 'true' && steps.c12.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.13) Run until the next save, then save a checkpoint
+      - name: Run VM (part 13)
+        id: c13
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 13 - collect apps
+        if: ${{ steps.c13.outputs.ran == 'true' && steps.c13.outputs.stopped != 'true' && steps.c13.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 13 - save
+        if: ${{ steps.c13.outputs.ran == 'true' && steps.c13.outputs.stopped != 'true' && steps.c13.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c13
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 13 - clean old saves
+        if: ${{ steps.c13.outputs.ran == 'true' && steps.c13.outputs.stopped != 'true' && steps.c13.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.14) Run until the next save, then save a checkpoint
+      - name: Run VM (part 14)
+        id: c14
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 14 - collect apps
+        if: ${{ steps.c14.outputs.ran == 'true' && steps.c14.outputs.stopped != 'true' && steps.c14.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 14 - save
+        if: ${{ steps.c14.outputs.ran == 'true' && steps.c14.outputs.stopped != 'true' && steps.c14.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c14
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 14 - clean old saves
+        if: ${{ steps.c14.outputs.ran == 'true' && steps.c14.outputs.stopped != 'true' && steps.c14.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.15) Run until the next save, then save a checkpoint
+      - name: Run VM (part 15)
+        id: c15
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 15 - collect apps
+        if: ${{ steps.c15.outputs.ran == 'true' && steps.c15.outputs.stopped != 'true' && steps.c15.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 15 - save
+        if: ${{ steps.c15.outputs.ran == 'true' && steps.c15.outputs.stopped != 'true' && steps.c15.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c15
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 15 - clean old saves
+        if: ${{ steps.c15.outputs.ran == 'true' && steps.c15.outputs.stopped != 'true' && steps.c15.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.16) Run until the next save, then save a checkpoint
+      - name: Run VM (part 16)
+        id: c16
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 16 - collect apps
+        if: ${{ steps.c16.outputs.ran == 'true' && steps.c16.outputs.stopped != 'true' && steps.c16.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 16 - save
+        if: ${{ steps.c16.outputs.ran == 'true' && steps.c16.outputs.stopped != 'true' && steps.c16.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c16
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 16 - clean old saves
+        if: ${{ steps.c16.outputs.ran == 'true' && steps.c16.outputs.stopped != 'true' && steps.c16.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.17) Run until the next save, then save a checkpoint
+      - name: Run VM (part 17)
+        id: c17
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 17 - collect apps
+        if: ${{ steps.c17.outputs.ran == 'true' && steps.c17.outputs.stopped != 'true' && steps.c17.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 17 - save
+        if: ${{ steps.c17.outputs.ran == 'true' && steps.c17.outputs.stopped != 'true' && steps.c17.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c17
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 17 - clean old saves
+        if: ${{ steps.c17.outputs.ran == 'true' && steps.c17.outputs.stopped != 'true' && steps.c17.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.18) Run until the next save, then save a checkpoint
+      - name: Run VM (part 18)
+        id: c18
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 18 - collect apps
+        if: ${{ steps.c18.outputs.ran == 'true' && steps.c18.outputs.stopped != 'true' && steps.c18.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 18 - save
+        if: ${{ steps.c18.outputs.ran == 'true' && steps.c18.outputs.stopped != 'true' && steps.c18.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c18
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 18 - clean old saves
+        if: ${{ steps.c18.outputs.ran == 'true' && steps.c18.outputs.stopped != 'true' && steps.c18.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.19) Run until the next save, then save a checkpoint
+      - name: Run VM (part 19)
+        id: c19
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 19 - collect apps
+        if: ${{ steps.c19.outputs.ran == 'true' && steps.c19.outputs.stopped != 'true' && steps.c19.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 19 - save
+        if: ${{ steps.c19.outputs.ran == 'true' && steps.c19.outputs.stopped != 'true' && steps.c19.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c19
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 19 - clean old saves
+        if: ${{ steps.c19.outputs.ran == 'true' && steps.c19.outputs.stopped != 'true' && steps.c19.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.20) Run until the next save, then save a checkpoint
+      - name: Run VM (part 20)
+        id: c20
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 20 - collect apps
+        if: ${{ steps.c20.outputs.ran == 'true' && steps.c20.outputs.stopped != 'true' && steps.c20.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 20 - save
+        if: ${{ steps.c20.outputs.ran == 'true' && steps.c20.outputs.stopped != 'true' && steps.c20.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c20
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 20 - clean old saves
+        if: ${{ steps.c20.outputs.ran == 'true' && steps.c20.outputs.stopped != 'true' && steps.c20.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.21) Run until the next save, then save a checkpoint
+      - name: Run VM (part 21)
+        id: c21
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 21 - collect apps
+        if: ${{ steps.c21.outputs.ran == 'true' && steps.c21.outputs.stopped != 'true' && steps.c21.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 21 - save
+        if: ${{ steps.c21.outputs.ran == 'true' && steps.c21.outputs.stopped != 'true' && steps.c21.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c21
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 21 - clean old saves
+        if: ${{ steps.c21.outputs.ran == 'true' && steps.c21.outputs.stopped != 'true' && steps.c21.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.22) Run until the next save, then save a checkpoint
+      - name: Run VM (part 22)
+        id: c22
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 22 - collect apps
+        if: ${{ steps.c22.outputs.ran == 'true' && steps.c22.outputs.stopped != 'true' && steps.c22.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 22 - save
+        if: ${{ steps.c22.outputs.ran == 'true' && steps.c22.outputs.stopped != 'true' && steps.c22.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c22
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 22 - clean old saves
+        if: ${{ steps.c22.outputs.ran == 'true' && steps.c22.outputs.stopped != 'true' && steps.c22.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.23) Run until the next save, then save a checkpoint
+      - name: Run VM (part 23)
+        id: c23
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 23 - collect apps
+        if: ${{ steps.c23.outputs.ran == 'true' && steps.c23.outputs.stopped != 'true' && steps.c23.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 23 - save
+        if: ${{ steps.c23.outputs.ran == 'true' && steps.c23.outputs.stopped != 'true' && steps.c23.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c23
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 23 - clean old saves
+        if: ${{ steps.c23.outputs.ran == 'true' && steps.c23.outputs.stopped != 'true' && steps.c23.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.24) Run until the next save, then save a checkpoint
+      - name: Run VM (part 24)
+        id: c24
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 24 - collect apps
+        if: ${{ steps.c24.outputs.ran == 'true' && steps.c24.outputs.stopped != 'true' && steps.c24.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 24 - save
+        if: ${{ steps.c24.outputs.ran == 'true' && steps.c24.outputs.stopped != 'true' && steps.c24.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c24
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 24 - clean old saves
+        if: ${{ steps.c24.outputs.ran == 'true' && steps.c24.outputs.stopped != 'true' && steps.c24.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.25) Run until the next save, then save a checkpoint
+      - name: Run VM (part 25)
+        id: c25
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 25 - collect apps
+        if: ${{ steps.c25.outputs.ran == 'true' && steps.c25.outputs.stopped != 'true' && steps.c25.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 25 - save
+        if: ${{ steps.c25.outputs.ran == 'true' && steps.c25.outputs.stopped != 'true' && steps.c25.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c25
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 25 - clean old saves
+        if: ${{ steps.c25.outputs.ran == 'true' && steps.c25.outputs.stopped != 'true' && steps.c25.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.26) Run until the next save, then save a checkpoint
+      - name: Run VM (part 26)
+        id: c26
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 26 - collect apps
+        if: ${{ steps.c26.outputs.ran == 'true' && steps.c26.outputs.stopped != 'true' && steps.c26.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 26 - save
+        if: ${{ steps.c26.outputs.ran == 'true' && steps.c26.outputs.stopped != 'true' && steps.c26.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c26
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 26 - clean old saves
+        if: ${{ steps.c26.outputs.ran == 'true' && steps.c26.outputs.stopped != 'true' && steps.c26.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.27) Run until the next save, then save a checkpoint
+      - name: Run VM (part 27)
+        id: c27
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 27 - collect apps
+        if: ${{ steps.c27.outputs.ran == 'true' && steps.c27.outputs.stopped != 'true' && steps.c27.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 27 - save
+        if: ${{ steps.c27.outputs.ran == 'true' && steps.c27.outputs.stopped != 'true' && steps.c27.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c27
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 27 - clean old saves
+        if: ${{ steps.c27.outputs.ran == 'true' && steps.c27.outputs.stopped != 'true' && steps.c27.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.28) Run until the next save, then save a checkpoint
+      - name: Run VM (part 28)
+        id: c28
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 28 - collect apps
+        if: ${{ steps.c28.outputs.ran == 'true' && steps.c28.outputs.stopped != 'true' && steps.c28.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 28 - save
+        if: ${{ steps.c28.outputs.ran == 'true' && steps.c28.outputs.stopped != 'true' && steps.c28.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c28
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 28 - clean old saves
+        if: ${{ steps.c28.outputs.ran == 'true' && steps.c28.outputs.stopped != 'true' && steps.c28.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.29) Run until the next save, then save a checkpoint
+      - name: Run VM (part 29)
+        id: c29
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 29 - collect apps
+        if: ${{ steps.c29.outputs.ran == 'true' && steps.c29.outputs.stopped != 'true' && steps.c29.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 29 - save
+        if: ${{ steps.c29.outputs.ran == 'true' && steps.c29.outputs.stopped != 'true' && steps.c29.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c29
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 29 - clean old saves
+        if: ${{ steps.c29.outputs.ran == 'true' && steps.c29.outputs.stopped != 'true' && steps.c29.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.30) Run until the next save, then save a checkpoint
+      - name: Run VM (part 30)
+        id: c30
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 30 - collect apps
+        if: ${{ steps.c30.outputs.ran == 'true' && steps.c30.outputs.stopped != 'true' && steps.c30.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 30 - save
+        if: ${{ steps.c30.outputs.ran == 'true' && steps.c30.outputs.stopped != 'true' && steps.c30.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c30
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 30 - clean old saves
+        if: ${{ steps.c30.outputs.ran == 'true' && steps.c30.outputs.stopped != 'true' && steps.c30.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.31) Run until the next save, then save a checkpoint
+      - name: Run VM (part 31)
+        id: c31
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 31 - collect apps
+        if: ${{ steps.c31.outputs.ran == 'true' && steps.c31.outputs.stopped != 'true' && steps.c31.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 31 - save
+        if: ${{ steps.c31.outputs.ran == 'true' && steps.c31.outputs.stopped != 'true' && steps.c31.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c31
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 31 - clean old saves
+        if: ${{ steps.c31.outputs.ran == 'true' && steps.c31.outputs.stopped != 'true' && steps.c31.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.32) Run until the next save, then save a checkpoint
+      - name: Run VM (part 32)
+        id: c32
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 32 - collect apps
+        if: ${{ steps.c32.outputs.ran == 'true' && steps.c32.outputs.stopped != 'true' && steps.c32.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 32 - save
+        if: ${{ steps.c32.outputs.ran == 'true' && steps.c32.outputs.stopped != 'true' && steps.c32.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c32
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 32 - clean old saves
+        if: ${{ steps.c32.outputs.ran == 'true' && steps.c32.outputs.stopped != 'true' && steps.c32.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6.33) Run until the next save, then save a checkpoint
+      - name: Run VM (part 33)
+        id: c33
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stop requested, skipping."; exit 0 }
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          if ((Get-Date) -ge $handoff) { Write-Host "Time is up, skipping."; exit 0 }
+          $mins = [int]"${{ github.event.inputs.save_every || '10' }}"
+          if ($mins -lt 10) { $mins = 10 }
+          $end = (Get-Date).AddMinutes($mins)
+          if ($end -ge $handoff) {
+            $end = $handoff
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "last=true"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "ran=true"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "stopped=true"
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      - name: Checkpoint 33 - collect apps
+        if: ${{ steps.c33.outputs.ran == 'true' && steps.c33.outputs.stopped != 'true' && steps.c33.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Checkpoint 33 - save
+        if: ${{ steps.c33.outputs.ran == 'true' && steps.c33.outputs.stopped != 'true' && steps.c33.outputs.last != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c33
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Checkpoint 33 - clean old saves
+        if: ${{ steps.c33.outputs.ran == 'true' && steps.c33.outputs.stopped != 'true' && steps.c33.outputs.last != 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+
+      # 6z) Wait for the handoff time if the saves above did not fill it
+      - name: Wait until handoff time
+        shell: pwsh
+        run: |
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $handoff = [datetime]::Parse((Get-Content C:\handoff-time.txt), $inv)
+          while ((Get-Date) -lt $handoff -and -not (Test-Path C:\stop.flag)) {
+            if (Test-Path "C:\Users\runneradmin\Desktop\STOP.txt") {
+              New-Item C:\stop.flag -Force | Out-Null
+              Write-Host "STOP file found, ending safely."
+              break
+            }
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      # 7) HANDOFF: save, start the next session early, keep this one up until its end
+      - name: Decide handoff
+        id: h
+        shell: pwsh
+        run: |
+          if (Test-Path C:\stop.flag) { Write-Host "Stopped by you, no handoff."; exit 0 }
+          if ("${{ github.event.inputs.auto_restart || 'true' }}" -eq 'true') {
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "do=true"
+          }
+
+      - name: Handoff - collect apps
+        if: steps.h.outputs.do == 'true'
+        shell: pwsh
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Handoff - save state
+        if: steps.h.outputs.do == 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-handoff
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Handoff - start next session
+        if: steps.h.outputs.do == 'true'
+        shell: pwsh
+        run: |
+          gh workflow run windows-vm.yml -R ${{ github.repository }} -f hours=${{ github.event.inputs.hours || '5' }} -f auto_restart=true -f save_every=${{ github.event.inputs.save_every || '10' }} -f overlap=${{ github.event.inputs.overlap || '6' }}
+          Write-Host "Next session started. Connect to it when it is up; this one ends soon and will not save again."
+
+      - name: Handoff - stay up until the end
+        if: steps.h.outputs.do == 'true'
+        shell: pwsh
+        run: |
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $end = [datetime]::Parse((Get-Content C:\session-end.txt), $inv)
+          while ((Get-Date) -lt $end) {
+            try { & C:\mesa-copy.ps1 } catch {}
+            Start-Sleep -Seconds 15
+          }
+
+      # 8) FINAL SAVE (also runs when you cancel). Skipped after a handoff: the next session owns the state.
+      - name: Close apps so files are flushed
         if: always()
         shell: pwsh
         run: |
-          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[1:][].id'
-          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
+          Get-Process javaw, java, "TikTok LIVE Studio*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep 3
 
-      - name: Start next session
-        if: always() && steps.keep.outcome == 'success' && github.event.inputs.auto_restart == 'true'
+      - name: Final - collect apps
+        if: always() && steps.h.outputs.do != 'true'
         shell: pwsh
-        run: gh workflow run windows-vm.yml -R ${{ github.repository }} -f hours=${{ github.event.inputs.hours }} -f auto_restart=true
+        continue-on-error: true
+        run: '& C:\sync-out.ps1'
+
+      - name: Final - save state
+        if: always() && steps.h.outputs.do != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-final
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\.minecraft
+            C:\Users\runneradmin\AppData\Roaming\.tlauncher
+            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
+            C:\Users\runneradmin\AppData\Local\Roblox
+            C:\Users\runneradmin\Desktop
+            C:\Users\runneradmin\Documents
+            C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\RustDesk
+            C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
+            C:\Users\Public\Desktop
+            C:\Persist
+
+      - name: Final - clean old saves
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ids = gh cache list -R ${{ github.repository }} --key vm-state- --sort created_at --order desc --json id --jq '.[2:][].id'
+          foreach ($id in $ids) { gh cache delete $id -R ${{ github.repository }} }
