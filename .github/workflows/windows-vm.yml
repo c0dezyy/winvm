@@ -223,6 +223,51 @@ jobs:
           schtasks /create /tn KeepSession /tr "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\keep-session.ps1" /sc onstart /ru SYSTEM /f | Out-Null
           schtasks /run /tn KeepSession | Out-Null
 
+      # 3c2) Sound: the runner has no sound card, so add a virtual one (VB-CABLE) before RustDesk starts
+      - name: Set up sound
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          foreach ($svc in "AudioEndpointBuilder", "Audiosrv") {
+            try { Set-Service $svc -StartupType Automatic; Start-Service $svc; Write-Host "$svc running" } catch { Write-Host "Service ${svc}: $_" }
+          }
+          $zip = "C:\vbcable.zip"; $got = $false
+          foreach ($pack in "VBCABLE_Driver_Pack45.zip", "VBCABLE_Driver_Pack43.zip") {
+            try {
+              Invoke-WebRequest "https://download.vb-audio.com/Download_CABLE/$pack" -OutFile $zip -UseBasicParsing
+              Write-Host "Downloaded $pack"; $got = $true; break
+            } catch { Write-Host "$pack failed: $_" }
+          }
+          if (-not $got) { Write-Host "::error title=Sound::Could not download VB-CABLE"; exit 1 }
+          Expand-Archive $zip C:\vbcable -Force
+          # trust the driver publisher so Windows does not stop to ask
+          Get-ChildItem C:\vbcable -Recurse -Include *.cat, *.sys | ForEach-Object {
+            $c = (Get-AuthenticodeSignature $_.FullName).SignerCertificate
+            if ($c) {
+              $f = "C:\vbcable-$($c.Thumbprint).cer"
+              [IO.File]::WriteAllBytes($f, $c.Export("Cert"))
+              certutil -addstore TrustedPublisher $f | Out-Null
+            }
+          }
+          $setup = Get-ChildItem C:\vbcable -Recurse -Filter VBCABLE_Setup_x64.exe | Select-Object -First 1
+          # no -Wait: the installer can linger, so wait with a limit instead
+          $p = Start-Process $setup.FullName -ArgumentList "-i", "-h", "-H", "-n" -WorkingDirectory $setup.DirectoryName -PassThru
+          $p | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue
+          if (-not $p.HasExited) { $p | Stop-Process -Force -ErrorAction SilentlyContinue }
+          Start-Sleep 8
+          Restart-Service Audiosrv -Force -ErrorAction SilentlyContinue
+          Start-Sleep 3
+          # make the virtual card the default speaker (best effort)
+          try {
+            Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
+            Install-Module AudioDeviceCmdlets -Force -Scope CurrentUser -AllowClobber
+            Import-Module AudioDeviceCmdlets
+            $d = Get-AudioDevice -List | Where-Object { $_.Type -eq "Playback" -and $_.Name -like "CABLE Input*" } | Select-Object -First 1
+            if ($d) { Set-AudioDevice -ID $d.ID | Out-Null; Write-Host "Default sound output: $($d.Name)" }
+          } catch { Write-Host "Could not set the default device: $_" }
+          Write-Host ("Sound devices: " + ((Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue | ForEach-Object { $_.FriendlyName }) -join ", "))
+
       # 3d) RustDesk: connect anytime with an ID + password (same ID every session)
       - name: Install RustDesk
         shell: pwsh
