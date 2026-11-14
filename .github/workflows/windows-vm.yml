@@ -52,6 +52,10 @@ jobs:
             C:\TLauncher
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
 
       # 3) Apps
       - name: Install apps
@@ -86,6 +90,24 @@ jobs:
             $sh = (New-Object -ComObject WScript.Shell).CreateShortcut("$desktop\TikTok LIVE Studio download.url")
             $sh.TargetPath = "https://www.tiktok.com/live/studio"
             $sh.Save()
+          }
+
+      # 3a) Auto-reinstall your own apps every session (edit Documents\apps.txt inside the VM)
+      - name: Reinstall my apps
+        shell: pwsh
+        timeout-minutes: 20
+        continue-on-error: true
+        run: |
+          $list = "C:\Users\runneradmin\Documents\apps.txt"
+          if (-not (Test-Path $list)) {
+            Set-Content $list "# One Chocolatey package name per line, e.g. obs-studio or vlc. They reinstall automatically every session."
+            exit 0
+          }
+          foreach ($line in Get-Content $list) {
+            $n = $line.Trim()
+            if (-not $n -or $n.StartsWith("#")) { continue }
+            Write-Host "Installing $n"
+            choco install $n -y --no-progress
           }
 
       # 3b) Software OpenGL (Mesa) so Minecraft runs without a video card
@@ -234,6 +256,49 @@ jobs:
           Write-Host "::notice title=RustDesk::ID: $id  |  Password: your RUSTDESK_PASSWORD"
           Add-Content $env:GITHUB_STEP_SUMMARY "## RustDesk`n- **ID:** ``$id```n- **Password:** the RUSTDESK_PASSWORD secret"
 
+      # 3e) Bigger screen and 100% scaling so windows and the taskbar fit
+      - name: Set screen size
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name LogPixels -Value 96 -Type DWord
+            Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name Win8DpiScaling -Value 1 -Type DWord
+          } catch { Write-Host "Scaling not set: $_" }
+          $code = @'
+          using System;
+          using System.Runtime.InteropServices;
+          public class Disp {
+            [DllImport("user32.dll", CharSet = CharSet.Ansi)] public static extern bool EnumDisplaySettings(string d, int m, ref DEVMODE dm);
+            [DllImport("user32.dll", CharSet = CharSet.Ansi)] public static extern int ChangeDisplaySettings(ref DEVMODE dm, int f);
+            [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+            public struct DEVMODE {
+              [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+              public short dmSpecVersion; public short dmDriverVersion; public short dmSize; public short dmDriverExtra;
+              public int dmFields;
+              public int dmPositionX; public int dmPositionY; public int dmDisplayOrientation; public int dmDisplayFixedOutput;
+              public short dmColor; public short dmDuplex; public short dmYResolution; public short dmTTOption; public short dmCollate;
+              [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+              public short dmLogPixels; public int dmBitsPerPel; public int dmPelsWidth; public int dmPelsHeight;
+              public int dmDisplayFlags; public int dmDisplayFrequency;
+              public int dmICMMethod; public int dmICMIntent; public int dmMediaType; public int dmDitherType;
+              public int dmReserved1; public int dmReserved2; public int dmPanningWidth; public int dmPanningHeight;
+            }
+          }
+          '@
+          Add-Type -TypeDefinition $code
+          $dm = New-Object Disp+DEVMODE
+          $dm.dmSize = [Runtime.InteropServices.Marshal]::SizeOf($dm)
+          if ([Disp]::EnumDisplaySettings($null, -1, [ref]$dm)) {
+            Write-Host "Current screen: $($dm.dmPelsWidth)x$($dm.dmPelsHeight)"
+            foreach ($res in @(@(1920,1080), @(1600,900), @(1366,768))) {
+              $dm.dmPelsWidth = $res[0]; $dm.dmPelsHeight = $res[1]; $dm.dmFields = 0x180000
+              $r = [Disp]::ChangeDisplaySettings([ref]$dm, 1)
+              Write-Host "Tried $($res[0])x$($res[1]) -> code $r (0 = success)"
+              if ($r -eq 0) { break }
+            }
+          } else { Write-Host "Could not read the display settings." }
+
       # 4) Remote access through Tailscale (free, no card needed)
       - name: Start Tailscale
         shell: pwsh
@@ -318,6 +383,10 @@ jobs:
             C:\TLauncher
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
+            C:\Apps
+            C:\Users\runneradmin\Downloads
+            C:\Users\runneradmin\AppData\Local\Programs
+            C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
 
       # 8) Delete older saves (repo cache limit is 10 GB) and chain the next session
       - name: Clean old saves
