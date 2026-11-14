@@ -100,18 +100,30 @@ jobs:
             & "C:\Program Files\7-Zip\7z.exe" x C:\mesa.7z -oC:\mesa -y | Out-Null
             Write-Host "Mesa ready: $($asset.name)"
           } catch { Write-Host "Mesa download failed: $_" }
+          # System-wide: replace the Windows opengl32.dll with Mesa's, so Minecraft works whatever Java it uses
+          try {
+            $sys = "C:\Windows\System32"
+            takeown /f "$sys\opengl32.dll" | Out-Null
+            icacls "$sys\opengl32.dll" /grant "Administrators:F" | Out-Null
+            if (-not (Test-Path "$sys\opengl32.orig.dll")) { Rename-Item "$sys\opengl32.dll" "opengl32.orig.dll" }
+            foreach ($n in "opengl32.dll","libgallium_wgl.dll","libglapi.dll") {
+              if (Test-Path "C:\mesa\x64\$n") { Copy-Item "C:\mesa\x64\$n" $sys -Force }
+            }
+            Write-Host "System-wide Mesa installed: $(Test-Path "$sys\libgallium_wgl.dll")"
+          } catch { Write-Host "System-wide Mesa failed: $_" }
           # helper that drops the Mesa DLLs next to every Java used by Minecraft (re-run while the VM is alive)
           $script = @'
           $src = "C:\mesa\x64"
           if (-not (Test-Path $src)) { exit }
           $names = "opengl32.dll","libgallium_wgl.dll","libglapi.dll","libGLESv2.dll","libEGL.dll"
-          $roots = "C:\Users\runneradmin\AppData\Roaming\.minecraft\runtime","C:\TLauncher","C:\Program Files\Eclipse Adoptium","C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk"
+          $roots = "C:\Users\runneradmin\AppData\Roaming\.minecraft\runtime","C:\Users\runneradmin\AppData\Roaming\.tlauncher","C:\Program Files\Java","C:\TLauncher","C:\Program Files\Eclipse Adoptium","C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk"
           foreach ($r in $roots) {
             if (-not (Test-Path $r)) { continue }
             Get-ChildItem $r -Recurse -Include javaw.exe,java.exe -ErrorAction SilentlyContinue | ForEach-Object {
               $d = $_.DirectoryName
               if (-not (Test-Path "$d\opengl32.dll")) {
                 foreach ($n in $names) { if (Test-Path "$src\$n") { Copy-Item "$src\$n" $d -Force -ErrorAction SilentlyContinue } }
+                Add-Content C:\mesa-copy.log "$(Get-Date) copied Mesa to $d"
               }
             }
           }
