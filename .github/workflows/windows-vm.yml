@@ -43,6 +43,7 @@ jobs:
 
       # 2) RESTORE saved state from the previous session (worlds, settings, logins)
       - name: Restore saved state
+        id: restore
         uses: actions/cache/restore@v4
         with:
           key: vm-state-none
@@ -65,6 +66,18 @@ jobs:
             C:\Users\runneradmin\AppData\Roaming\Microsoft\Windows\Start Menu\Programs
             C:\Users\Public\Desktop
             C:\Persist
+
+      - name: Check saved state was found
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $hit = "${{ steps.restore.outputs.cache-matched-key }}"
+          if ($hit) {
+            Write-Host "Saved state restored from: $hit"
+          } else {
+            Write-Host "::warning title=No saved state restored::Nothing was restored. Normal on the very first run. If you expected saved data, the newest saves are listed below."
+            gh cache list -R ${{ github.repository }} --key vm-state- --limit 5
+          }
 
       # 2b) Put apps you installed last time back into Program Files
       - name: Restore installed apps
@@ -223,6 +236,60 @@ jobs:
           schtasks /create /tn KeepSession /tr "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\keep-session.ps1" /sc onstart /ru SYSTEM /f | Out-Null
           schtasks /run /tn KeepSession | Out-Null
 
+      # 3b2) Screen size first, so RustDesk starts after the final resolution (avoids flicker and white strips)
+      - name: Set screen size
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name LogPixels -Value 96 -Type DWord
+            Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name Win8DpiScaling -Value 1 -Type DWord
+          } catch { Write-Host "Scaling not set: $_" }
+          # calmer desktop for remote viewing: no transparency or window animations (these cause flicker over remote capture)
+          foreach ($item in @(
+            @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize', 'EnableTransparency', 0),
+            @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects', 'VisualFXSetting', 2)
+          )) {
+            try {
+              if (-not (Test-Path $item[0])) { New-Item -Path $item[0] -Force | Out-Null }
+              Set-ItemProperty -Path $item[0] -Name $item[1] -Value $item[2] -Type DWord
+            } catch { Write-Host "Visual setting $($item[1]) not changed: $_" }
+          }
+          try { Set-ItemProperty 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name MinAnimate -Value "0" } catch {}
+          $code = @'
+          using System;
+          using System.Runtime.InteropServices;
+          public class Disp {
+            [DllImport("user32.dll", CharSet = CharSet.Ansi)] public static extern bool EnumDisplaySettings(string d, int m, ref DEVMODE dm);
+            [DllImport("user32.dll", CharSet = CharSet.Ansi)] public static extern int ChangeDisplaySettings(ref DEVMODE dm, int f);
+            [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+            public struct DEVMODE {
+              [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+              public short dmSpecVersion; public short dmDriverVersion; public short dmSize; public short dmDriverExtra;
+              public int dmFields;
+              public int dmPositionX; public int dmPositionY; public int dmDisplayOrientation; public int dmDisplayFixedOutput;
+              public short dmColor; public short dmDuplex; public short dmYResolution; public short dmTTOption; public short dmCollate;
+              [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+              public short dmLogPixels; public int dmBitsPerPel; public int dmPelsWidth; public int dmPelsHeight;
+              public int dmDisplayFlags; public int dmDisplayFrequency;
+              public int dmICMMethod; public int dmICMIntent; public int dmMediaType; public int dmDitherType;
+              public int dmReserved1; public int dmReserved2; public int dmPanningWidth; public int dmPanningHeight;
+            }
+          }
+          '@
+          Add-Type -TypeDefinition $code
+          $dm = New-Object Disp+DEVMODE
+          $dm.dmSize = [Runtime.InteropServices.Marshal]::SizeOf($dm)
+          if ([Disp]::EnumDisplaySettings($null, -1, [ref]$dm)) {
+            Write-Host "Current screen: $($dm.dmPelsWidth)x$($dm.dmPelsHeight)"
+            foreach ($res in @(@(1920,1080), @(1600,900), @(1366,768))) {
+              $dm.dmPelsWidth = $res[0]; $dm.dmPelsHeight = $res[1]; $dm.dmFields = 0x180000
+              $r = [Disp]::ChangeDisplaySettings([ref]$dm, 1)
+              Write-Host "Tried $($res[0])x$($res[1]) -> code $r (0 = success)"
+              if ($r -eq 0) { break }
+            }
+          } else { Write-Host "Could not read the display settings." }
+
       # 3c2) Sound: the runner has no sound card, so add a virtual one (VB-CABLE) before RustDesk starts
       - name: Set up sound
         shell: pwsh
@@ -327,49 +394,6 @@ jobs:
           Write-Host "::notice title=RustDesk::ID: $id  |  Password: your RUSTDESK_PASSWORD"
           Add-Content $env:GITHUB_STEP_SUMMARY "## RustDesk`n- **ID:** ``$id```n- **Password:** the RUSTDESK_PASSWORD secret"
 
-      # 3e) Bigger screen and 100% scaling so windows and the taskbar fit
-      - name: Set screen size
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          try {
-            Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name LogPixels -Value 96 -Type DWord
-            Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name Win8DpiScaling -Value 1 -Type DWord
-          } catch { Write-Host "Scaling not set: $_" }
-          $code = @'
-          using System;
-          using System.Runtime.InteropServices;
-          public class Disp {
-            [DllImport("user32.dll", CharSet = CharSet.Ansi)] public static extern bool EnumDisplaySettings(string d, int m, ref DEVMODE dm);
-            [DllImport("user32.dll", CharSet = CharSet.Ansi)] public static extern int ChangeDisplaySettings(ref DEVMODE dm, int f);
-            [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
-            public struct DEVMODE {
-              [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
-              public short dmSpecVersion; public short dmDriverVersion; public short dmSize; public short dmDriverExtra;
-              public int dmFields;
-              public int dmPositionX; public int dmPositionY; public int dmDisplayOrientation; public int dmDisplayFixedOutput;
-              public short dmColor; public short dmDuplex; public short dmYResolution; public short dmTTOption; public short dmCollate;
-              [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
-              public short dmLogPixels; public int dmBitsPerPel; public int dmPelsWidth; public int dmPelsHeight;
-              public int dmDisplayFlags; public int dmDisplayFrequency;
-              public int dmICMMethod; public int dmICMIntent; public int dmMediaType; public int dmDitherType;
-              public int dmReserved1; public int dmReserved2; public int dmPanningWidth; public int dmPanningHeight;
-            }
-          }
-          '@
-          Add-Type -TypeDefinition $code
-          $dm = New-Object Disp+DEVMODE
-          $dm.dmSize = [Runtime.InteropServices.Marshal]::SizeOf($dm)
-          if ([Disp]::EnumDisplaySettings($null, -1, [ref]$dm)) {
-            Write-Host "Current screen: $($dm.dmPelsWidth)x$($dm.dmPelsHeight)"
-            foreach ($res in @(@(1920,1080), @(1600,900), @(1366,768))) {
-              $dm.dmPelsWidth = $res[0]; $dm.dmPelsHeight = $res[1]; $dm.dmFields = 0x180000
-              $r = [Disp]::ChangeDisplaySettings([ref]$dm, 1)
-              Write-Host "Tried $($res[0])x$($res[1]) -> code $r (0 = success)"
-              if ($r -eq 0) { break }
-            }
-          } else { Write-Host "Could not read the display settings." }
-
       # 4) Remote access through Tailscale (free, no card needed)
       - name: Start Tailscale
         shell: pwsh
@@ -414,12 +438,22 @@ jobs:
           if (-not $env:PROXY_URL) { Write-Host "No PROXY_URL set, skipping."; exit 0 }
           $u = [uri]$env:PROXY_URL
           $hostPort = "$($u.Host):$($u.Port)"
+          # IMPORTANT: a system-wide proxy also captures the GitHub Actions runner's own traffic.
+          # If the proxy is slow, down, or blocks a site the runner needs, GitHub sees that as
+          # "lost communication with the server" and kills the whole run - exactly the failure this
+          # fixes. The bypass list below excludes GitHub's and Azure Pipelines' own endpoints so the
+          # runner always reaches them directly, never through the proxy.
+          $bypass = "*.actions.githubusercontent.com;*.github.com;*.githubusercontent.com;*.pkg.github.com;" +
+                    "*.blob.core.windows.net;*.vstsagentpackage.azureedge.net;*.dc.services.visualstudio.com;" +
+                    "login.microsoftonline.com;<local>"
           $reg = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
           Set-ItemProperty $reg -Name ProxyEnable -Value 1
           Set-ItemProperty $reg -Name ProxyServer -Value $hostPort
-          netsh winhttp set proxy $hostPort | Out-Null
+          Set-ItemProperty $reg -Name ProxyOverride -Value $bypass
+          netsh winhttp set proxy proxy-server="$hostPort" bypass-list="$bypass" | Out-Null
           $opts = "-Dhttp.proxyHost=$($u.Host) -Dhttp.proxyPort=$($u.Port) -Dhttps.proxyHost=$($u.Host) -Dhttps.proxyPort=$($u.Port)"
           [Environment]::SetEnvironmentVariable("JAVA_TOOL_OPTIONS", $opts, "Machine")
+          Write-Host "Proxy applied for apps, with GitHub/Azure endpoints excluded so the runner stays reachable."
 
       # 5b) Remember what is installed now, and plan the session times
       - name: Take app baseline
