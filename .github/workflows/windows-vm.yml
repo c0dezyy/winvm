@@ -460,7 +460,13 @@ jobs:
         shell: pwsh
         run: |
           Get-ChildItem "C:\Program Files","C:\Program Files (x86)" -Directory | ForEach-Object { $_.FullName } | Set-Content C:\baseline-pf.txt
-          $end = (Get-Date).AddHours([double]"${{ github.event.inputs.hours || '5' }}")
+          # Hard safety clamp: GitHub cancels any job past 360 minutes no matter what hours= is set
+          # to, with no warning beyond "The operation was canceled." Staying under that on purpose
+          # means the workflow ends on its own terms (saved, handed off) instead of being cut off mid-save.
+          $hoursRequested = [double]"${{ github.event.inputs.hours || '5' }}"
+          $hours = [Math]::Min($hoursRequested, 5.3)
+          if ($hours -lt $hoursRequested) { Write-Host "hours=$hoursRequested is too close to GitHub's 360-minute hard limit; using $hours instead." }
+          $end = (Get-Date).AddHours($hours)
           $overlap = [int]"${{ github.event.inputs.overlap || '6' }}"
           $handoff = $end
           if ("${{ github.event.inputs.auto_restart || 'true' }}" -eq 'true') { $handoff = $end.AddMinutes(-$overlap) }
@@ -529,6 +535,33 @@ jobs:
           '@
           Set-Content C:\publish-info.ps1 $script
           & C:\publish-info.ps1 online
+
+      # 5c2) Reopen whatever software you were using, every session (edit Documents\startup.txt)
+      - name: Reopen your apps
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $list = "C:\Users\runneradmin\Documents\startup.txt"
+          if (-not (Test-Path $list)) {
+            Set-Content $list "# One program per line: either a full path (C:\TLauncher\TLauncher.jar won't work here - use the .lnk shortcut or .exe), or a Desktop shortcut name like 'TLauncher.lnk'. Lines starting with # are ignored. This file is saved with your other data, so it carries over every session."
+            exit 0
+          }
+          $desktop = "C:\Users\Public\Desktop"
+          foreach ($line in Get-Content $list) {
+            $target = $line.Trim()
+            if (-not $target -or $target.StartsWith("#")) { continue }
+            if (-not (Test-Path $target)) {
+              $onDesktop = Join-Path $desktop $target
+              if (Test-Path $onDesktop) { $target = $onDesktop }
+            }
+            if (Test-Path $target) {
+              Write-Host "Opening $target"
+              Start-Process $target
+              Start-Sleep 2
+            } else {
+              Write-Host "Not found, skipping: $target"
+            }
+          }
 
       # 6.1) Run until the next save, then save a checkpoint
       - name: Run VM (part 1)
