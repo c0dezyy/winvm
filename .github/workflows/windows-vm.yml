@@ -58,6 +58,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -94,6 +95,27 @@ jobs:
             }
           }
           exit 0
+
+      # 2c) Make Firefox resume your last tabs and logins automatically, every session
+      - name: Set up Firefox persistence
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $iniPath = "C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox\profiles.ini"
+          if (-not (Test-Path $iniPath)) { Write-Host "No Firefox profile yet (first run, or nothing restored)."; exit 0 }
+          $profiles = Select-String -Path $iniPath -Pattern '^Path=(.+)$' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+          foreach ($rel in $profiles) {
+            $dir = if ($rel -match '^Profiles/') { "C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox\$rel" } else { "C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox\Profiles\$rel" }
+            if (-not (Test-Path $dir)) { continue }
+            $userJs = Join-Path $dir "user.js"
+            @'
+          // Written every session: always reopen exactly the tabs you had open, with no "restore session?" prompt.
+          user_pref("browser.startup.page", 3);
+          user_pref("browser.sessionstore.resume_from_crash", true);
+          user_pref("browser.sessionstore.max_resumed_crashes", -1);
+          '@ | Set-Content -Path $userJs
+            Write-Host "Tab restore enabled for profile: $dir"
+          }
 
       # 3) Apps
       - name: Install apps
@@ -543,8 +565,11 @@ jobs:
         run: |
           $list = "C:\Users\runneradmin\Documents\startup.txt"
           if (-not (Test-Path $list)) {
-            Set-Content $list "# One program per line: either a full path (C:\TLauncher\TLauncher.jar won't work here - use the .lnk shortcut or .exe), or a Desktop shortcut name like 'TLauncher.lnk'. Lines starting with # are ignored. This file is saved with your other data, so it carries over every session."
-            exit 0
+            @(
+              "# One program per line: either a full path, or a Desktop shortcut name like 'TLauncher.lnk'.",
+              "# Lines starting with # are ignored. This file is saved with your other data, so it carries over every session.",
+              "C:\Program Files\Mozilla Firefox\firefox.exe"
+            ) | Set-Content $list
           }
           $desktop = "C:\Users\Public\Desktop"
           foreach ($line in Get-Content $list) {
@@ -613,6 +638,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -680,6 +706,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -747,6 +774,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -814,6 +842,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -881,6 +910,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -948,6 +978,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -1015,6 +1046,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -1082,6 +1114,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -1149,6 +1182,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -1216,6 +1250,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -1283,6 +1318,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -1350,6 +1386,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -1417,6 +1454,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -1484,6 +1522,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -1551,6 +1590,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -1618,6 +1658,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -1685,6 +1726,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -1752,6 +1794,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -1819,6 +1862,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -1886,6 +1930,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -1953,6 +1998,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -2020,6 +2066,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -2087,6 +2134,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -2154,6 +2202,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -2221,6 +2270,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -2288,6 +2338,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -2355,6 +2406,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -2422,6 +2474,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -2489,6 +2542,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -2556,6 +2610,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -2623,6 +2678,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -2690,6 +2746,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -2757,6 +2814,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -2805,6 +2863,21 @@ jobs:
         if: steps.h.outputs.do == 'true'
         shell: pwsh
         run: |
+          function Close-BrowsersGracefully {
+            $procs = Get-Process firefox, chrome, msedge -ErrorAction SilentlyContinue
+            if (-not $procs) { return }
+            foreach ($p in $procs) { try { $p.CloseMainWindow() | Out-Null } catch {} }
+            $deadline = (Get-Date).AddSeconds(15)
+            while ((Get-Date) -lt $deadline) {
+              $left = Get-Process firefox, chrome, msedge -ErrorAction SilentlyContinue
+              if (-not $left) { break }
+              Start-Sleep -Milliseconds 500
+            }
+            Get-Process firefox, chrome, msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+          # Firefox (and Chrome/Edge) closed the normal way, so tabs, logins and cookies save properly -
+          # this always runs on a handoff, not only when STOP.txt was used.
+          Close-BrowsersGracefully
           if (Test-Path C:\restart-now.flag) {
             Write-Host "STOP.txt used: closing apps, saving, and starting the next session now."
             Get-Process javaw, java, "TikTok LIVE Studio*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -2831,6 +2904,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
@@ -2867,6 +2941,19 @@ jobs:
         if: always()
         shell: pwsh
         run: |
+          function Close-BrowsersGracefully {
+            $procs = Get-Process firefox, chrome, msedge -ErrorAction SilentlyContinue
+            if (-not $procs) { return }
+            foreach ($p in $procs) { try { $p.CloseMainWindow() | Out-Null } catch {} }
+            $deadline = (Get-Date).AddSeconds(15)
+            while ((Get-Date) -lt $deadline) {
+              $left = Get-Process firefox, chrome, msedge -ErrorAction SilentlyContinue
+              if (-not $left) { break }
+              Start-Sleep -Milliseconds 500
+            }
+            Get-Process firefox, chrome, msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+          Close-BrowsersGracefully
           Get-Process javaw, java, "TikTok LIVE Studio*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           Start-Sleep 3
 
@@ -2896,6 +2983,7 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
             C:\Apps
