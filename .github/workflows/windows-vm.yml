@@ -497,6 +497,8 @@ jobs:
       # 4) Remote access through Tailscale (free, no card needed)
       - name: Start Tailscale
         shell: pwsh
+        continue-on-error: true   # a Tailscale problem must never kill the VM or RustDesk
+        timeout-minutes: 10
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
@@ -504,10 +506,54 @@ jobs:
             Write-Host "::error title=Missing secret::Add the TAILSCALE_AUTHKEY secret."
             exit 1
           }
-          New-NetFirewallRule -DisplayName "RDP-3389" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow | Out-Null
-          choco install tailscale -y --no-progress
+          New-NetFirewallRule -DisplayName "RDP-3389" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue | Out-Null
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          & $ts up --authkey=$env:TS_AUTHKEY --hostname=winvm --unattended --accept-dns=false
+
+          # Install, with fallbacks: the Chocolatey feed sometimes returns 503, so try the official installer directly first
+          function Install-TailscaleDirect {
+            foreach ($url in "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi", "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe") {
+              try {
+                $ext = if ($url.EndsWith(".msi")) { "msi" } else { "exe" }
+                $f = "C:\tailscale-setup.$ext"
+                Invoke-WebRequest $url -OutFile $f -UseBasicParsing
+                Write-Host "Downloaded $url"
+                if ($ext -eq "msi") {
+                  $p = Start-Process msiexec.exe -ArgumentList "/i `"$f`" /quiet /norestart TS_UNATTENDEDMODE=always" -PassThru
+                } else {
+                  $p = Start-Process $f -ArgumentList "/quiet" -PassThru
+                }
+                $p | Wait-Process -Timeout 240 -ErrorAction SilentlyContinue
+                for ($i = 0; $i -lt 20 -and -not (Test-Path $ts); $i++) { Start-Sleep 3 }
+                if (Test-Path $ts) { return $true }
+              } catch { Write-Host "Direct install from $url failed: $_" }
+            }
+            return $false
+          }
+          for ($try = 1; $try -le 3 -and -not (Test-Path $ts); $try++) {
+            Write-Host "Tailscale install, direct try $try"
+            if (Install-TailscaleDirect) { break }
+            Start-Sleep 5
+          }
+          for ($try = 1; $try -le 3 -and -not (Test-Path $ts); $try++) {
+            Write-Host "Tailscale install, Chocolatey try $try"
+            choco install tailscale -y --no-progress
+            if (-not (Test-Path $ts)) { Start-Sleep 10 }
+          }
+          if (-not (Test-Path $ts)) {
+            Write-Host "::error title=Tailscale::Could not install Tailscale from any source. RustDesk still works; Remote Desktop over Tailscale is unavailable this session."
+            exit 1
+          }
+
+          # make sure the background service is up before connecting
+          Set-Service Tailscale -StartupType Automatic -ErrorAction SilentlyContinue
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+          for ($i = 0; $i -lt 15 -and (Get-Service Tailscale -ErrorAction SilentlyContinue).Status -ne 'Running'; $i++) { Start-Sleep 2 }
+
+          $up = $false
+          for ($try = 1; $try -le 3 -and -not $up; $try++) {
+            & $ts up --authkey=$env:TS_AUTHKEY --hostname=winvm --unattended --accept-dns=false
+            if ($LASTEXITCODE -eq 0) { $up = $true } else { Write-Host "tailscale up failed (try $try), retrying"; Start-Sleep 5 }
+          }
           $ip = $null
           for ($i = 0; $i -lt 30 -and -not $ip; $i++) {
             Start-Sleep 2
