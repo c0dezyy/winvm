@@ -59,14 +59,9 @@ jobs:
           restore-keys: |
             vm-state-
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -129,40 +124,6 @@ jobs:
           }
 
       # 3) Apps
-      - name: Install apps
-        shell: pwsh
-        env:
-          TIKTOK_STUDIO_URL: ${{ vars.TIKTOK_STUDIO_URL }}
-        run: |
-          $desktop = "C:\Users\Public\Desktop"
-          $startup = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
-          New-Item -ItemType Directory -Force -Path C:\TLauncher | Out-Null
-
-          # TLauncher jar: only download if not restored from the saved state
-          try {
-            if (-not (Test-Path "C:\TLauncher\TLauncher.jar")) {
-              Invoke-WebRequest -Uri "https://tlauncher.org/jar" -OutFile "C:\TLauncher\TLauncher.jar" -UseBasicParsing
-            }
-            $java = (Get-Command javaw.exe).Source
-            foreach ($dir in @($desktop, $startup)) {
-              $sh = (New-Object -ComObject WScript.Shell).CreateShortcut("$dir\TLauncher.lnk")
-              $sh.TargetPath = $java
-              $sh.Arguments = '-jar "C:\TLauncher\TLauncher.jar"'
-              $sh.WorkingDirectory = "C:\TLauncher"
-              $sh.Save()
-            }
-          } catch { Write-Host "TLauncher setup failed: $_" }
-
-          # TikTok LIVE Studio: apps are not saved, only their data/login. Set TIKTOK_STUDIO_URL to reinstall automatically.
-          if ($env:TIKTOK_STUDIO_URL) {
-            Invoke-WebRequest -Uri $env:TIKTOK_STUDIO_URL -OutFile "C:\tiktok-studio-setup.exe" -UseBasicParsing
-            Start-Process "C:\tiktok-studio-setup.exe" -ArgumentList "/S" -Wait
-          } else {
-            $sh = (New-Object -ComObject WScript.Shell).CreateShortcut("$desktop\TikTok LIVE Studio download.url")
-            $sh.TargetPath = "https://www.tiktok.com/live/studio"
-            $sh.Save()
-          }
-
       # 3a) Auto-reinstall your own apps every session (edit Documents\apps.txt inside the VM)
       - name: Reinstall my apps
         shell: pwsh
@@ -234,7 +195,7 @@ jobs:
           $src = Get-Content C:\mesa-dir.txt -ErrorAction SilentlyContinue
           if (-not $src -or -not (Test-Path $src)) { exit }
           $names = "opengl32.dll","libgallium_wgl.dll","libglapi.dll","dxil.dll"
-          $roots = "C:\Users\runneradmin\AppData\Roaming\.minecraft\runtime","C:\Users\runneradmin\AppData\Roaming\.tlauncher","C:\Program Files\Java","C:\TLauncher","C:\Program Files\Eclipse Adoptium","C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk"
+          $roots = "C:\Program Files\Java","C:\Program Files\Eclipse Adoptium","C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk"
           foreach ($r in $roots) {
             if (-not (Test-Path $r)) { continue }
             Get-ChildItem $r -Recurse -Include javaw.exe,java.exe -ErrorAction SilentlyContinue | ForEach-Object {
@@ -619,7 +580,7 @@ jobs:
           $list = "C:\Users\runneradmin\Documents\startup.txt"
           if (-not (Test-Path $list)) {
             @(
-              "# One program per line: either a full path, or a Desktop shortcut name like 'TLauncher.lnk'.",
+              "# One program per line: either a full path, or a Desktop shortcut name like 'SomeApp.lnk'.",
               "# Lines starting with # are ignored. This file is saved with your other data, so it carries over every session.",
               "C:\Program Files\Mozilla Firefox\firefox.exe"
             ) | Set-Content $list
@@ -683,14 +644,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c1
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -753,14 +709,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c2
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -823,14 +774,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c3
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -893,14 +839,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c4
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -963,14 +904,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c5
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -1033,14 +969,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c6
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -1103,14 +1034,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c7
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -1173,14 +1099,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c8
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -1243,14 +1164,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c9
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -1313,14 +1229,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c10
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -1383,14 +1294,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c11
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -1453,14 +1359,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c12
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -1523,14 +1424,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c13
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -1593,14 +1489,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c14
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -1663,14 +1554,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c15
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -1733,14 +1619,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c16
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -1803,14 +1684,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c17
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -1873,14 +1749,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c18
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -1943,14 +1814,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c19
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -2013,14 +1879,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c20
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -2083,14 +1944,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c21
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -2153,14 +2009,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c22
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -2223,14 +2074,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c23
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -2293,14 +2139,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c24
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -2363,14 +2204,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c25
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -2433,14 +2269,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c26
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -2503,14 +2334,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c27
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -2573,14 +2399,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c28
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -2643,14 +2464,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c29
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -2713,14 +2529,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c30
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -2783,14 +2594,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c31
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -2853,14 +2659,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c32
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -2923,14 +2724,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-c33
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -3025,14 +2821,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-handoff
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
@@ -3106,14 +2897,9 @@ jobs:
         with:
           key: vm-state-${{ github.run_id }}-${{ github.run_attempt }}-final
           path: |
-            C:\Users\runneradmin\AppData\Roaming\.minecraft
-            C:\Users\runneradmin\AppData\Roaming\.tlauncher
-            C:\Users\runneradmin\AppData\Roaming\TikTok LIVE Studio
-            C:\Users\runneradmin\AppData\Local\TikTok LIVE Studio
             C:\Users\runneradmin\AppData\Local\Roblox
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
-            C:\TLauncher
             C:\total-deadline.txt
             C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
