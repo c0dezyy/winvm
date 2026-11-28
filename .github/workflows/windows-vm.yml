@@ -15,6 +15,12 @@ on:
       overlap:
         description: "Minutes before the end to start the next session"
         default: "6"
+      limit_session:
+        description: "Limit the total time before it stops on its own (true/false). false = keeps auto-restarting forever"
+        default: "true"
+      limit_hours:
+        description: "Total hours before it stops, if limit_session is true"
+        default: "24"
 
 permissions:
   contents: read
@@ -28,12 +34,15 @@ jobs:
       GH_TOKEN: ${{ github.token }}
 
     steps:
-      # 1) Remote Desktop + password
+      # 1) Remote Desktop + password (optional now - RustDesk and Chrome Remote Desktop don't need this;
+      #    only set RDP_PASSWORD if you have your own way to reach port 3389, e.g. your own VPN)
       - name: Enable RDP and set password
         shell: pwsh
+        continue-on-error: true
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
+          if (-not $env:RDP_PASSWORD) { Write-Host "No RDP_PASSWORD secret, skipping (RustDesk / Chrome Remote Desktop do not need this)."; exit 0 }
           Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
@@ -58,6 +67,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -278,6 +289,33 @@ jobs:
             } catch { Write-Host "Visual setting $($item[1]) not changed: $_" }
           }
           try { Set-ItemProperty 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name MinAnimate -Value "0" } catch {}
+
+          # Remove the "Test Mode / Windows Server Evaluation / build number" text Windows draws over the
+          # desktop background, and set a plain, normal-looking wallpaper instead.
+          try {
+            Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name PaintDesktopVersion -Value 0 -Type DWord
+            $wallpaper = "C:\Windows\Web\Wallpaper\Windows\img0.jpg"
+            if (Test-Path $wallpaper) {
+              Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name Wallpaper -Value $wallpaper
+              Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value "10"
+              $sig = @'
+              using System;
+              using System.Runtime.InteropServices;
+              public class Wall {
+                [DllImport("user32.dll", CharSet = CharSet.Auto)]
+                public static extern int SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+              }
+          '@
+              Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue
+              [Wall]::SystemParametersInfo(20, 0, $wallpaper, 3) | Out-Null   # SPI_SETDESKWALLPAPER, update + broadcast
+            }
+            # Restart Explorer so the watermark disappears immediately, without a reboot
+            Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep 2
+            if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
+            Write-Host "Desktop watermark removed, wallpaper set."
+          } catch { Write-Host "Could not change the desktop watermark/wallpaper: $_" }
+
           $code = @'
           using System;
           using System.Runtime.InteropServices;
@@ -357,6 +395,24 @@ jobs:
           } catch { Write-Host "Could not set the default device: $_" }
           Write-Host ("Sound devices: " + ((Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue | ForEach-Object { $_.FriendlyName }) -join ", "))
 
+      # 3f) Chrome Remote Desktop (no VPN, works from a Chromebook/phone/anything with a browser)
+      - name: Install Chrome Remote Desktop
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $already = Test-Path "C:\ProgramData\Google\Chrome Remote Desktop\host.json"
+          Invoke-WebRequest "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile C:\crd.msi -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i C:\crd.msi /quiet /norestart" -Wait
+          if ($already) {
+            Write-Host "Chrome Remote Desktop: already paired from a previous session, should reconnect on its own."
+          } else {
+            Write-Host "Chrome Remote Desktop installed. ONE-TIME SETUP NEEDED (can't be done by this script - it requires signing in to a Google account in a browser):"
+            Write-Host "  1. Connect to this VM once with RustDesk."
+            Write-Host "  2. Inside the VM, open Chrome and go to remotedesktop.google.com/access"
+            Write-Host "  3. Sign in, click Set up, name this device, set a PIN."
+            Write-Host "  Once done, it stays paired across every future session automatically - no need to repeat this."
+          }
+
       # 3d) RustDesk: connect anytime with an ID + password (same ID every session)
       - name: Install RustDesk
         shell: pwsh
@@ -380,76 +436,52 @@ jobs:
           Write-Host "RustDesk installed: $(Test-Path $rd)"
           if (-not (Test-Path $rd)) { Write-Host "::error title=RustDesk::Install failed"; exit 1 }
 
-          if (-not (Get-Service RustDesk -ErrorAction SilentlyContinue)) {
-            Start-Process $rd -ArgumentList "--install-service" | Out-Null
-            Start-Sleep 15
-          }
-          Start-Service RustDesk -ErrorAction SilentlyContinue
-
-          $p = Start-Process $rd -ArgumentList "--password", $env:RUSTDESK_PASSWORD -PassThru
-          $p | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
-          if (-not $p.HasExited) { $p | Stop-Process -Force -ErrorAction SilentlyContinue }
-          Write-Host "Password set"
-
           $id = ""
-          for ($i = 0; $i -lt 5 -and -not $id; $i++) {
-            $job = Start-Job -ScriptBlock { param($r) cmd /c "`"$r`" --get-id | more" } -ArgumentList $rd
-            if (Wait-Job $job -Timeout 20) { $id = (Receive-Job $job | Out-String).Trim() }
-            Stop-Job $job -ErrorAction SilentlyContinue
-            Remove-Job $job -Force -ErrorAction SilentlyContinue
-            if (-not $id) { Start-Sleep 3 }
-          }
-          if (-not $id) {
-            foreach ($f in "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config\RustDesk.toml", "$env:APPDATA\RustDesk\config\RustDesk.toml") {
-              if (Test-Path $f) {
-                $m = Select-String -Path $f -Pattern "^id\s*=\s*'?(\d+)'?"
-                if ($m) { $id = $m.Matches[0].Groups[1].Value; break }
+          for ($attempt = 1; $attempt -le 2 -and -not $id; $attempt++) {
+            Write-Host "RustDesk service/ID attempt $attempt of 2"
+            if (-not (Get-Service RustDesk -ErrorAction SilentlyContinue)) {
+              Start-Process $rd -ArgumentList "--install-service" | Out-Null
+              for ($i = 0; $i -lt 20 -and -not (Get-Service RustDesk -ErrorAction SilentlyContinue); $i++) { Start-Sleep 2 }
+            }
+            $svc = Get-Service RustDesk -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne "Running") { Start-Service RustDesk -ErrorAction SilentlyContinue; Start-Sleep 3 }
+            $svc = Get-Service RustDesk -ErrorAction SilentlyContinue
+            Write-Host "RustDesk service status: $(if ($svc) { $svc.Status } else { 'not found' })"
+
+            $p = Start-Process $rd -ArgumentList "--password", $env:RUSTDESK_PASSWORD -PassThru
+            $p | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
+            if (-not $p.HasExited) { $p | Stop-Process -Force -ErrorAction SilentlyContinue }
+            Write-Host "Password set"
+
+            for ($i = 0; $i -lt 6 -and -not $id; $i++) {
+              $job = Start-Job -ScriptBlock { param($r) cmd /c "`"$r`" --get-id | more" } -ArgumentList $rd
+              if (Wait-Job $job -Timeout 20) { $id = (Receive-Job $job | Out-String).Trim() }
+              Stop-Job $job -ErrorAction SilentlyContinue
+              Remove-Job $job -Force -ErrorAction SilentlyContinue
+              if (-not $id) { Start-Sleep 3 }
+            }
+            if (-not $id) {
+              foreach ($f in "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config\RustDesk.toml", "$env:APPDATA\RustDesk\config\RustDesk.toml") {
+                if (Test-Path $f) {
+                  $m = Select-String -Path $f -Pattern "^id\s*=\s*'?(\d+)'?"
+                  if ($m) { $id = $m.Matches[0].Groups[1].Value; break }
+                }
               }
+            }
+            if (-not $id -and $attempt -eq 1) {
+              Write-Host "No ID yet, restarting the RustDesk service and trying once more..."
+              Restart-Service RustDesk -ErrorAction SilentlyContinue
+              Start-Sleep 5
             }
           }
           if (-not $id) {
-            Write-Host "::error title=RustDesk::Could not read the RustDesk ID."
+            Write-Host "::error title=RustDesk::Could not read the RustDesk ID after 2 attempts."
             exit 1
           }
           Write-Host "RUSTDESK ID: $id"
           Set-Content C:\rustdesk-id.txt $id -NoNewline
           Write-Host "::notice title=RustDesk::ID: $id  |  Password: your RUSTDESK_PASSWORD"
           Add-Content $env:GITHUB_STEP_SUMMARY "## RustDesk`n- **ID:** ``$id```n- **Password:** the RUSTDESK_PASSWORD secret"
-
-      # 4) Remote access through Tailscale (free, no card needed)
-      - name: Start Tailscale
-        shell: pwsh
-        env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          if (-not $env:TS_AUTHKEY) {
-            Write-Host "::error title=Missing secret::Add the TAILSCALE_AUTHKEY secret."
-            exit 1
-          }
-          New-NetFirewallRule -DisplayName "RDP-3389" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow | Out-Null
-          choco install tailscale -y --no-progress
-          $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          & $ts up --authkey=$env:TS_AUTHKEY --hostname=winvm --unattended
-          $ip = $null
-          for ($i = 0; $i -lt 30 -and -not $ip; $i++) {
-            Start-Sleep 2
-            $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
-          }
-          if (-not $ip) {
-            Write-Host "::error title=Tailscale failed::No Tailscale IP. Check that TAILSCALE_AUTHKEY is a valid, unexpired key."
-            exit 1
-          }
-          Write-Host "RDP ADDRESS: $ip"
-          Set-Content C:\ts-ip.txt $ip -NoNewline
-          Write-Host "::notice title=Remote Desktop::Address: $ip (or winvm)  |  User: runneradmin  |  Password: your RDP_PASSWORD"
-          $msg = @"
-          ## Remote Desktop details
-          - **Address:** ``$ip`` (or ``winvm``)
-          - **Username:** ``runneradmin``
-          - **Password:** the RDP_PASSWORD secret you set
-          Your device must be logged into the same Tailscale account.
-          "@
-          Add-Content $env:GITHUB_STEP_SUMMARY $msg
 
       # 5) Optional proxy
       - name: Apply proxy (optional)
@@ -496,6 +528,27 @@ jobs:
           Set-Content C:\session-end.txt $end.ToString("o")
           Set-Content C:\handoff-time.txt $handoff.ToString("o")
           Write-Host "Session ends: $end | next session starts at: $handoff"
+
+          # Total time limit across the whole auto-restart chain, not just this one segment.
+          # Computed once on the very first session, then carried forward (saved/restored) so every
+          # later session in the chain honors the SAME original deadline instead of resetting it.
+          if (Test-Path C:\total-deadline.txt) {
+            $saved = (Get-Content C:\total-deadline.txt -Raw).Trim()
+          } else { $saved = "" }
+          if ($saved -eq "infinite") {
+            Write-Host "Session time limit: disabled (continuing an existing infinite chain)."
+          } elseif ($saved) {
+            $totalDeadline = [datetime]::Parse($saved, [Globalization.CultureInfo]::InvariantCulture)
+            Write-Host "Session time limit: continuing an existing chain, stops at $totalDeadline"
+          } elseif ("${{ github.event.inputs.limit_session || 'true' }}" -eq 'true') {
+            $limitHours = [double]"${{ github.event.inputs.limit_hours || '24' }}"
+            $totalDeadline = (Get-Date).AddHours($limitHours)
+            Set-Content C:\total-deadline.txt $totalDeadline.ToString("o")
+            Write-Host "Session time limit: $limitHours hours total, stops at $totalDeadline"
+          } else {
+            Set-Content C:\total-deadline.txt "infinite"
+            Write-Host "Session time limit: disabled, will keep auto-restarting until you use STOP.txt or SHUTDOWN.txt"
+          }
           $sync = @'
           if (-not (Test-Path C:\baseline-pf.txt)) { exit 0 }
           $base = @(Get-Content C:\baseline-pf.txt)
@@ -539,7 +592,7 @@ jobs:
           $end = [DateTimeOffset]::Parse((ReadInfo C:\session-end.txt).Trim(), $inv).ToUnixTimeSeconds()
           $info = [ordered]@{
             status = $Status; id = (ReadInfo C:\rustdesk-id.txt); pw = (ReadInfo C:\rustdesk-pw.txt)
-            ip = (ReadInfo C:\ts-ip.txt); host = "winvm"; user = "runneradmin"
+            user = "runneradmin"
             start = $start; end = $end; ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
           } | ConvertTo-Json -Compress
           $salt = [byte[]]::new(16); [Security.Cryptography.RandomNumberGenerator]::Fill($salt)
@@ -638,6 +691,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -706,6 +761,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -774,6 +831,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -842,6 +901,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -910,6 +971,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -978,6 +1041,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -1046,6 +1111,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -1114,6 +1181,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -1182,6 +1251,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -1250,6 +1321,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -1318,6 +1391,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -1386,6 +1461,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -1454,6 +1531,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -1522,6 +1601,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -1590,6 +1671,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -1658,6 +1741,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -1726,6 +1811,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -1794,6 +1881,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -1862,6 +1951,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -1930,6 +2021,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -1998,6 +2091,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -2066,6 +2161,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -2134,6 +2231,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -2202,6 +2301,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -2270,6 +2371,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -2338,6 +2441,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -2406,6 +2511,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -2474,6 +2581,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -2542,6 +2651,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -2610,6 +2721,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -2678,6 +2791,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -2746,6 +2861,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -2814,6 +2931,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -2855,6 +2974,16 @@ jobs:
         shell: pwsh
         run: |
           if (Test-Path C:\shutdown.flag) { Write-Host "Shutdown requested, no restart."; exit 0 }
+          if (Test-Path C:\total-deadline.txt) {
+            $saved = (Get-Content C:\total-deadline.txt -Raw).Trim()
+            if ($saved -ne "infinite") {
+              $deadline = [datetime]::Parse($saved, [Globalization.CultureInfo]::InvariantCulture)
+              if ((Get-Date) -ge $deadline) {
+                Write-Host "Total time limit reached ($deadline), stopping for good - not starting another session."
+                exit 0
+              }
+            }
+          }
           if ("${{ github.event.inputs.auto_restart || 'true' }}" -eq 'true') {
             Add-Content -Path $env:GITHUB_OUTPUT -Value "do=true"
           }
@@ -2904,6 +3033,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
@@ -2918,7 +3049,7 @@ jobs:
         if: steps.h.outputs.do == 'true'
         shell: pwsh
         run: |
-          gh workflow run windows-vm.yml -R ${{ github.repository }} -f hours=${{ github.event.inputs.hours || '5' }} -f auto_restart=true -f save_every=${{ github.event.inputs.save_every || '10' }} -f overlap=${{ github.event.inputs.overlap || '6' }}
+          gh workflow run windows-vm.yml -R ${{ github.repository }} -f hours=${{ github.event.inputs.hours || '5' }} -f auto_restart=true -f save_every=${{ github.event.inputs.save_every || '10' }} -f overlap=${{ github.event.inputs.overlap || '6' }} -f limit_session=${{ github.event.inputs.limit_session || 'true' }} -f limit_hours=${{ github.event.inputs.limit_hours || '24' }}
           Write-Host "Next session started. Connect to it when it is up; this one ends soon and will not save again."
 
       - name: Handoff - stay up until the end
@@ -2983,6 +3114,8 @@ jobs:
             C:\Users\runneradmin\Desktop
             C:\Users\runneradmin\Documents
             C:\TLauncher
+            C:\total-deadline.txt
+            C:\ProgramData\Google\Chrome Remote Desktop
             C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox
             C:\Users\runneradmin\AppData\Roaming\RustDesk
             C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk
